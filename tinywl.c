@@ -162,32 +162,63 @@ static void keyboard_handle_modifiers(
 		&keyboard->wlr_keyboard->modifiers);
 }
 
-static bool handle_keybinding(struct tinywl_server *server, xkb_keysym_t sym) {
-	/*
-	 * Here we handle compositor keybindings. This is when the compositor is
-	 * processing keys, rather than passing them on to the client for its own
-	 * processing.
-	 *
-	 * This function assumes Alt is held down.
-	 */
-	switch (sym) {
-	case XKB_KEY_Escape:
-		wl_display_terminate(server->wl_display);
-		break;
-	case XKB_KEY_F1:
-		/* Cycle to the next toplevel */
-		if (wl_list_length(&server->toplevels) < 2) {
-			break;
-		}
-		struct tinywl_toplevel *next_toplevel =
-			wl_container_of(server->toplevels.prev, next_toplevel, link);
-		focus_toplevel(next_toplevel, next_toplevel->xdg_toplevel->base->surface);
-		break;
-	default:
-		return false;
-	}
-	return true;
+// keybindings
+/* First a bunch of functions that will handle them */
+
+static void handle_exit(struct tinywl_server *server) {
+    wl_display_terminate(server->wl_display);
 }
+
+static void handle_cycle_window(struct tinywl_server *server) {
+    if (wl_list_length(&server->toplevels) < 2) {
+        return;
+    }
+    struct tinywl_toplevel *next_toplevel =
+        wl_container_of(server->toplevels.prev, next_toplevel, link);
+    focus_toplevel(next_toplevel, next_toplevel->xdg_toplevel->base->surface);
+}
+
+static void handle_terminal(struct tinywl_server *server) {
+    if (wl_list_length(&server->toplevels) < 2) {
+        return;
+    }
+    struct tinywl_toplevel *next_toplevel =
+        wl_container_of(server->toplevels.prev, next_toplevel, link);
+    focus_toplevel(next_toplevel, next_toplevel->xdg_toplevel->base->surface);
+}
+
+/* Put the functions in an array */
+
+struct keybinding {
+    uint32_t modifiers; // bit array for Alt etc.
+    xkb_keysym_t sym;
+    void (*handler)(struct tinywl_server *server);
+};
+
+static const struct keybinding keybindings[] = {
+    { WLR_MODIFIER_LOGO, XKB_KEY_Escape, handle_exit },
+    { WLR_MODIFIER_LOGO, XKB_KEY_Tab,    handle_cycle_window },
+    { WLR_MODIFIER_LOGO, XKB_KEY_Return, handle_terminal }
+};
+
+static bool handle_keybinding(struct tinywl_server *server,
+        uint32_t current_modifiers, xkb_keysym_t sym) {
+    size_t num_bindings = sizeof(keybindings) / sizeof(keybindings[0]);
+
+    for (size_t i = 0; i < num_bindings; i++) {
+        if (~current_modifiers & keybindings[i].modifiers) {
+            // Move on if some needed modifier key is NOT held down.
+            // We don't care if extra modifier keys are held down.
+            continue;
+        }
+        if (keybindings[i].sym == sym) {
+            keybindings[i].handler(server);
+            return true;
+        }
+    }
+    return false; /* No keybinding applies, let the client handle it */
+}
+
 
 static void keyboard_handle_key(
 		struct wl_listener *listener, void *data) {
@@ -198,30 +229,26 @@ static void keyboard_handle_key(
 	struct wlr_keyboard_key_event *event = data;
 	struct wlr_seat *seat = server->seat;
 
-	/* Translate libinput keycode -> xkbcommon */
-	uint32_t keycode = event->keycode + 8;
-	/* Get a list of keysyms based on the keymap for this keyboard */
-	const xkb_keysym_t *syms;
-	int nsyms = xkb_state_key_get_syms(
-			keyboard->wlr_keyboard->xkb_state, keycode, &syms);
+        if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+		/* Translate libinput keycode -> xkbcommon */
+		uint32_t keycode = event->keycode + 8;
+		/* Get a list of keysyms based on the keymap for this keyboard */
+		const xkb_keysym_t *syms;
+		int nsyms = xkb_state_key_get_syms(
+				keyboard->wlr_keyboard->xkb_state, keycode, &syms);
 
-	bool handled = false;
-	uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
-	if ((modifiers & WLR_MODIFIER_LOGO) &&
-			event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-		/* If alt is held down and this button was _pressed_, we attempt to
-		 * process it as a compositor keybinding. */
+		uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
 		for (int i = 0; i < nsyms; i++) {
-			handled = handle_keybinding(server, syms[i]);
+			if(handle_keybinding(server, modifiers, syms[i])) {
+                    	return;
+			}
 		}
 	}
 
-	if (!handled) {
-		/* Otherwise, we pass it along to the client. */
-		wlr_seat_set_keyboard(seat, keyboard->wlr_keyboard);
-		wlr_seat_keyboard_notify_key(seat, event->time_msec,
+	/* If key wasn't a press, or no shortcut matched, passs it on */
+	wlr_seat_set_keyboard(seat, keyboard->wlr_keyboard);
+	wlr_seat_keyboard_notify_key(seat, event->time_msec,
 			event->keycode, event->state);
-	}
 }
 
 static void keyboard_handle_destroy(struct wl_listener *listener, void *data) {

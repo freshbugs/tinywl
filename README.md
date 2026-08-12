@@ -1,3 +1,6 @@
+I am going to slowly add features to tinywl.
+Following is the original readme.
+
 # TinyWL
 
 This is the "minimum viable product" Wayland compositor based on wlroots. It
