@@ -201,6 +201,25 @@ static void handle_run(struct tinywl_server *server) {
     spawn("cmd=$(zenity --entry) && eval 'exec $cmd'");
 }
 
+// Raise the second window in the scene, without giving it keyboard focus.
+// This is so I can look at information in one window while typing in another
+// The scene tree and toplevels list go in and out of sync when you do this repeatedly
+// - we'll see if that's confusing (or buggy?)
+static void handle_peer_at_second_window(struct tinywl_server *server) {
+    // We need at least two windows to pull a background window forward
+    if (wl_list_length(&server->scene->tree.children) < 2) {
+        return;
+    }
+
+    // Get the top link (at the tail end of the children list)
+    struct wl_list *top_link = server->scene->tree.children.prev;
+    struct wl_list *second_link = top_link->prev;
+    struct wlr_scene_node *visual_second_node = 
+        wl_container_of(second_link, visual_second_node, link);
+
+    wlr_scene_node_raise_to_top(visual_second_node);
+}
+
 static void handle_volume_up(struct tinywl_server *server) {
     /* Increase volume by 5%, capping at 100% */
     spawn("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+ -l 1.0");
@@ -246,6 +265,7 @@ static const struct keybinding keybindings[] = {
     { WLR_MODIFIER_LOGO, XKB_KEY_Tab,    handle_cycle_window },
     { WLR_MODIFIER_LOGO, XKB_KEY_Return, handle_terminal },
     { WLR_MODIFIER_LOGO, XKB_KEY_r,      handle_run },
+    { WLR_MODIFIER_LOGO, XKB_KEY_p,      handle_peer_at_second_window },
 
     /* media keys */
     { 0,                 XKB_KEY_XF86AudioRaiseVolume,  handle_volume_up },
