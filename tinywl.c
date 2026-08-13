@@ -25,6 +25,9 @@
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/log.h>
 #include <xkbcommon/xkbcommon.h>
+#include <unistd.h>
+#include <stdlib.h>
+
 
 /* For brevity's sake, struct members are annotated where they are used. */
 enum tinywl_cursor_mode {
@@ -165,6 +168,16 @@ static void keyboard_handle_modifiers(
 // keybindings
 /* First a bunch of functions that will handle them */
 
+static void spawn_program(const char *cmd) {
+    if (fork() == 0) {
+        /* In the child process: spin up a shell to run our command */
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        /* If execl returns, it failed to execute */
+        _exit(1);
+    }
+}
+
+
 static void handle_exit(struct tinywl_server *server) {
     wl_display_terminate(server->wl_display);
 }
@@ -179,12 +192,38 @@ static void handle_cycle_window(struct tinywl_server *server) {
 }
 
 static void handle_terminal(struct tinywl_server *server) {
-    if (wl_list_length(&server->toplevels) < 2) {
-        return;
-    }
-    struct tinywl_toplevel *next_toplevel =
-        wl_container_of(server->toplevels.prev, next_toplevel, link);
-    focus_toplevel(next_toplevel, next_toplevel->xdg_toplevel->base->surface);
+    spawn_program("foot");
+}
+
+static void handle_volume_up(struct tinywl_server *server) {
+    /* Increase volume by 5%, capping at 100% */
+    spawn_program("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+ -l 1.0");
+}
+
+static void handle_volume_down(struct tinywl_server *server) {
+    /* Decrease volume by 5% */
+    spawn_program("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-");
+}
+
+static void handle_volume_toggle_mute(struct tinywl_server *server) {
+    /* Toggle audio mute state */
+    spawn_program("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle");
+}
+
+static void handle_toggle_mic_mute(struct tinywl_server *server) {
+    spawn_program("amixer set Capture toggle");
+}
+
+static void handle_brightness_up(struct tinywl_server *server) {
+    spawn_program("brightnessctl set 1%+");
+}
+
+static void handle_brightness_down(struct tinywl_server *server) {
+    spawn_program("brightnessctl set 1%-");
+}
+
+static void handle_toggle_pause(struct tinywl_server *server) {
+    spawn_program("playerctl play-pause");
 }
 
 /* Put the functions in an array */
@@ -198,7 +237,16 @@ struct keybinding {
 static const struct keybinding keybindings[] = {
     { WLR_MODIFIER_LOGO, XKB_KEY_Escape, handle_exit },
     { WLR_MODIFIER_LOGO, XKB_KEY_Tab,    handle_cycle_window },
-    { WLR_MODIFIER_LOGO, XKB_KEY_Return, handle_terminal }
+    { WLR_MODIFIER_LOGO, XKB_KEY_Return, handle_terminal },
+
+    /* media keys */
+    { 0,                 XKB_KEY_XF86AudioRaiseVolume,  handle_volume_up },
+    { 0,                 XKB_KEY_XF86AudioLowerVolume,  handle_volume_down },
+    { 0,                 XKB_KEY_XF86AudioMute,         handle_volume_toggle_mute },
+    { 0,                 XKB_KEY_XF86AudioMicMute,      handle_toggle_mic_mute },
+    { 0,                 XKB_KEY_XF86MonBrightnessUp,   handle_brightness_up },
+    { 0,                 XKB_KEY_XF86MonBrightnessDown, handle_brightness_down },
+    { 0,                 XKB_KEY_XF86Favorites,         handle_toggle_pause },
 };
 
 static bool handle_keybinding(struct tinywl_server *server,
