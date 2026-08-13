@@ -202,11 +202,11 @@ static void handle_run(struct tinywl_server *server) {
 }
 
 static void handle_battery(struct tinywl_server *server) {
-    spawn("upower -d | grep -m 1 percentage | zenity --info --text=\"$(cat)\"");
+    spawn("upower -d | grep -m 1 percentage | zenity --info --text=\"$(cat)\" --timeout=3");
 }
 
 static void handle_time(struct tinywl_server *server) {
-    spawn("zenity --info --text=\"$(date)\"");
+    spawn("zenity --info --text=\"$(date)\" --timeout=3");
 }
 
 static void handle_volume_up(struct tinywl_server *server) {
@@ -253,6 +253,7 @@ static const struct keybinding keybindings[] = {
     { WLR_MODIFIER_LOGO, XKB_KEY_Escape, handle_exit },
     { WLR_MODIFIER_LOGO, XKB_KEY_Tab,    handle_cycle_window },
     { WLR_MODIFIER_LOGO, XKB_KEY_Return, handle_terminal },
+    { WLR_MODIFIER_LOGO, XKB_KEY_r,      handle_run },
     { WLR_MODIFIER_LOGO, XKB_KEY_b,      handle_battery },
     { WLR_MODIFIER_LOGO, XKB_KEY_t,      handle_time },
 
