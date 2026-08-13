@@ -197,6 +197,10 @@ static void handle_terminal(struct tinywl_server *server) {
     spawn("foot");
 }
 
+static void handle_run(struct tinywl_server *server) {
+    spawn("cmd=$(zenity --entry) && eval 'exec $cmd'");
+}
+
 static void handle_volume_up(struct tinywl_server *server) {
     /* Increase volume by 5%, capping at 100% */
     spawn("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+ -l 1.0");
@@ -241,6 +245,7 @@ static const struct keybinding keybindings[] = {
     { WLR_MODIFIER_LOGO, XKB_KEY_Escape, handle_exit },
     { WLR_MODIFIER_LOGO, XKB_KEY_Tab,    handle_cycle_window },
     { WLR_MODIFIER_LOGO, XKB_KEY_Return, handle_terminal },
+    { WLR_MODIFIER_LOGO, XKB_KEY_r,      handle_run },
 
     /* media keys */
     { 0,                 XKB_KEY_XF86AudioRaiseVolume,  handle_volume_up },
