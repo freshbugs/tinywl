@@ -3,7 +3,8 @@ WAYLAND_SCANNER=$(shell pkg-config --variable=wayland_scanner wayland-scanner)
 LIBS=\
 	 $(shell pkg-config --cflags --libs "wlroots >= 0.17.0") \
 	 $(shell pkg-config --cflags --libs wayland-server) \
-	 $(shell pkg-config --cflags --libs xkbcommon)
+	 $(shell pkg-config --cflags --libs xkbcommon) \
+	 $(shell pkg-config --cflags --libs libinput)
 
 # wayland-scanner is a tool which generates C headers and rigging for Wayland
 # protocols, which are specified in XML. wlroots requires you to rig these up

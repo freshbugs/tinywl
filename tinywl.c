@@ -25,9 +25,9 @@
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/log.h>
 #include <xkbcommon/xkbcommon.h>
-#include <unistd.h>
-#include <stdlib.h>
 
+#include <libinput.h> // for tap-to-click
+#include <wlr/backend/libinput.h>
 
 /* For brevity's sake, struct members are annotated where they are used. */
 enum tinywl_cursor_mode {
@@ -168,12 +168,14 @@ static void keyboard_handle_modifiers(
 // keybindings
 /* First a bunch of functions that will handle them */
 
-static void spawn_program(const char *cmd) {
+static void spawn(const char *cmd) {
+    // A standard "grandchild" fork trick makes systemd deal with cleanup
     if (fork() == 0) {
-        /* In the child process: spin up a shell to run our command */
-        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
-        /* If execl returns, it failed to execute */
-        _exit(1);
+        if (fork() == 0) {
+            execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+            _exit(1); // if execl fails for some reason (rare)
+        }
+        _exit(0);
     }
 }
 
@@ -192,39 +194,40 @@ static void handle_cycle_window(struct tinywl_server *server) {
 }
 
 static void handle_terminal(struct tinywl_server *server) {
-    spawn_program("foot");
+    spawn("foot");
 }
 
 static void handle_volume_up(struct tinywl_server *server) {
     /* Increase volume by 5%, capping at 100% */
-    spawn_program("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+ -l 1.0");
+    spawn("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+ -l 1.0");
 }
 
 static void handle_volume_down(struct tinywl_server *server) {
     /* Decrease volume by 5% */
-    spawn_program("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-");
+    spawn("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-");
 }
 
 static void handle_volume_toggle_mute(struct tinywl_server *server) {
     /* Toggle audio mute state */
-    spawn_program("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle");
+    spawn("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle");
 }
 
 static void handle_toggle_mic_mute(struct tinywl_server *server) {
-    spawn_program("amixer set Capture toggle");
+    spawn("amixer set Capture toggle");
 }
 
 static void handle_brightness_up(struct tinywl_server *server) {
-    spawn_program("brightnessctl set 1%+");
+    spawn("brightnessctl set 1%+");
 }
 
 static void handle_brightness_down(struct tinywl_server *server) {
-    spawn_program("brightnessctl set 1%-");
+    spawn("brightnessctl set 1%-");
 }
 
 static void handle_toggle_pause(struct tinywl_server *server) {
-    spawn_program("playerctl play-pause");
+    spawn("playerctl play-pause");
 }
+
 
 /* Put the functions in an array */
 
@@ -348,11 +351,16 @@ static void server_new_keyboard(struct tinywl_server *server,
 
 static void server_new_pointer(struct tinywl_server *server,
 		struct wlr_input_device *device) {
-	/* We don't do anything special with pointers. All of our pointer handling
-	 * is proxied through wlr_cursor. On another compositor, you might take this
-	 * opportunity to do libinput configuration on the device to set
-	 * acceleration, etc. */
 	wlr_cursor_attach_input_device(server->cursor, device);
+
+    /* Configure Tap-to-Click if this is a libinput device (like a touchpad) */
+    if (wlr_input_device_is_libinput(device)) {
+        struct libinput_device *libinput_dev = wlr_libinput_get_device_handle(device);
+        if (libinput_device_config_tap_get_finger_count(libinput_dev) > 0) {
+            libinput_device_config_tap_set_enabled(libinput_dev, LIBINPUT_CONFIG_TAP_ENABLED);
+            
+        }
+    }
 }
 
 static void server_new_input(struct wl_listener *listener, void *data) {
