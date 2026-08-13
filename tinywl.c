@@ -201,6 +201,11 @@ static void handle_run(struct tinywl_server *server) {
     spawn("cmd=$(zenity --entry) && eval 'exec $cmd'");
 }
 
+static void handle_status(struct tinywl_server *server) {
+    spawn("d=$(date +'%H:%M')$(upower -i /org/freedesktop/UPower/devices/battery_BAT0 | grep percentage) && zenity --info --text=\"$d\"");
+}
+
+
 static void handle_volume_up(struct tinywl_server *server) {
     /* Increase volume by 5%, capping at 100% */
     spawn("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+ -l 1.0");
@@ -246,6 +251,7 @@ static const struct keybinding keybindings[] = {
     { WLR_MODIFIER_LOGO, XKB_KEY_Tab,    handle_cycle_window },
     { WLR_MODIFIER_LOGO, XKB_KEY_Return, handle_terminal },
     { WLR_MODIFIER_LOGO, XKB_KEY_r,      handle_run },
+    { WLR_MODIFIER_LOGO, XKB_KEY_s,      handle_status },
 
     /* media keys */
     { 0,                 XKB_KEY_XF86AudioRaiseVolume,  handle_volume_up },
