@@ -93,6 +93,8 @@ struct tinywl_toplevel {
 	struct wl_listener request_resize;
 	struct wl_listener request_maximize;
 	struct wl_listener request_fullscreen;
+
+        float opacity;
 };
 
 struct tinywl_keyboard {
@@ -165,7 +167,8 @@ static void keyboard_handle_modifiers(
 		&keyboard->wlr_keyboard->modifiers);
 }
 
-// keybindings
+/* keybindings */
+
 /* First a bunch of functions that will handle them */
 
 static void spawn(const char *cmd) {
@@ -201,38 +204,46 @@ static void handle_run(struct tinywl_server *server) {
     spawn("cmd=$(zenity --entry) && eval 'exec $cmd'");
 }
 
-// Raise the second window in the scene, without giving it keyboard focus.
-// This is so I can look at information in one window while typing in another
-// The scene tree and toplevels list go in and out of sync when you do this repeatedly
-// - we'll see if that's confusing (or buggy?)
-static void handle_peer_at_second_window(struct tinywl_server *server) {
-    // We need at least two windows to pull a background window forward
-    if (wl_list_length(&server->scene->tree.children) < 2) {
-        return;
-    }
-
-    // Get the top link (at the tail end of the children list)
-    struct wl_list *top_link = server->scene->tree.children.prev;
-    struct wl_list *second_link = top_link->prev;
-    struct wlr_scene_node *visual_second_node = 
-        wl_container_of(second_link, visual_second_node, link);
-
-    wlr_scene_node_raise_to_top(visual_second_node);
+/* Helper function. Must be of a certain type. */
+static void set_opacity_iterator(struct wlr_scene_buffer *buffer, 
+                                 int sx, int sy, void *data) {
+    (void)sx;
+    (void)sy;
+    float *opacity = data;
+    wlr_scene_buffer_set_opacity(buffer, *opacity);
 }
 
-static void handle_volume_up(struct tinywl_server *server) {
-    /* Increase volume by 5%, capping at 100% */
-    spawn("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+ -l 1.0");
+/* Toggle the opacity of the focused window.
+ * This makes some simplifying assumptions that are true for now:
+ *  - this is the only function altering opacities,
+ *  - the focused window is first in the toplevels list, and
+ *  - we want the window to keep its opacity as-is when it loses focus. */
+static void handle_toggle_opacity(struct tinywl_server *server) {
+    if (wl_list_empty(&server->toplevels)) {
+        return;
+    }
+    
+    struct tinywl_toplevel *toplevel = wl_container_of(server->toplevels.next, toplevel, link);
+
+    toplevel->opacity = toplevel->opacity > 0.5 ? 0.3 : 1.0;
+
+    wlr_scene_node_for_each_buffer(&toplevel->scene_tree->node, 
+                                   set_opacity_iterator, &toplevel->opacity);
+}
+
+
+// media key functions
+
+static void handle_volume_toggle_mute(struct tinywl_server *server) {
+    spawn("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle");
 }
 
 static void handle_volume_down(struct tinywl_server *server) {
-    /* Decrease volume by 5% */
     spawn("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-");
 }
 
-static void handle_volume_toggle_mute(struct tinywl_server *server) {
-    /* Toggle audio mute state */
-    spawn("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle");
+static void handle_volume_up(struct tinywl_server *server) {
+    spawn("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+ -l 1.0");
 }
 
 static void handle_toggle_mic_mute(struct tinywl_server *server) {
@@ -265,7 +276,7 @@ static const struct keybinding keybindings[] = {
     { WLR_MODIFIER_LOGO, XKB_KEY_Tab,    handle_cycle_window },
     { WLR_MODIFIER_LOGO, XKB_KEY_Return, handle_terminal },
     { WLR_MODIFIER_LOGO, XKB_KEY_r,      handle_run },
-    { WLR_MODIFIER_LOGO, XKB_KEY_p,      handle_peer_at_second_window },
+    { WLR_MODIFIER_LOGO, XKB_KEY_o,      handle_toggle_opacity },
 
     /* media keys */
     { 0,                 XKB_KEY_XF86AudioRaiseVolume,  handle_volume_up },
@@ -352,8 +363,17 @@ static void server_new_keyboard(struct tinywl_server *server,
 	/* We need to prepare an XKB keymap and assign it to the keyboard. This
 	 * assumes the defaults (e.g. layout = "us"). */
 	struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-	struct xkb_keymap *keymap = xkb_keymap_new_from_names(context, NULL,
-		XKB_KEYMAP_COMPILE_NO_FLAGS);
+
+        // Use ~/.confif/xkb/symbols/custom to make F23 the compose key
+        struct xkb_rule_names rules = {
+            .rules = NULL,
+            .model = NULL,
+            .layout = "us,custom(compose_f23)",
+            .variant = NULL,
+            .options = NULL,
+        };
+        struct xkb_keymap *keymap = xkb_keymap_new_from_names(context, &rules,
+            XKB_KEYMAP_COMPILE_NO_FLAGS);
 
 	wlr_keyboard_set_keymap(wlr_keyboard, keymap);
 	xkb_keymap_unref(keymap);
@@ -902,6 +922,8 @@ static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
 	struct tinywl_toplevel *toplevel = calloc(1, sizeof(*toplevel));
 	toplevel->server = server;
 	toplevel->xdg_toplevel = xdg_surface->toplevel;
+        toplevel->opacity = 1.0f; // added: keep local opacities to give to the renderer
+
 	toplevel->scene_tree = wlr_scene_xdg_surface_create(
 			&toplevel->server->scene->tree, toplevel->xdg_toplevel->base);
 	toplevel->scene_tree->node.data = toplevel;
