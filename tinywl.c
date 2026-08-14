@@ -26,6 +26,9 @@
 #include <wlr/util/log.h>
 #include <xkbcommon/xkbcommon.h>
 
+#include <xkbcommon/xkbcommon-compose.h> // for compose
+#include <wlr/types/wlr_text_input_v3.h> // for zwp_text_input_manaer_v3, for compose
+
 #include <libinput.h> // for tap-to-click
 #include <wlr/backend/libinput.h>
 
@@ -70,6 +73,10 @@ struct tinywl_server {
 	struct wlr_output_layout *output_layout;
 	struct wl_list outputs;
 	struct wl_listener new_output;
+
+	// for the compose key
+	struct xkb_compose_table *compose_table;
+	struct wlr_text_input_manager_v3 *text_input_mgr;
 };
 
 struct tinywl_output {
@@ -105,6 +112,8 @@ struct tinywl_keyboard {
 	struct wl_listener modifiers;
 	struct wl_listener key;
 	struct wl_listener destroy;
+
+	struct xkb_compose_state *compose_state;
 };
 
 static void focus_toplevel(struct tinywl_toplevel *toplevel, struct wlr_surface *surface) {
@@ -306,36 +315,96 @@ static bool handle_keybinding(struct tinywl_server *server,
     return false; /* No keybinding applies, let the client handle it */
 }
 
+static void keyboard_handle_key(struct wl_listener *listener, void *data) {
+    struct tinywl_keyboard *keyboard = wl_container_of(listener, keyboard, key);
+    struct wlr_keyboard_key_event *event = data;
 
-static void keyboard_handle_key(
-		struct wl_listener *listener, void *data) {
-	/* This event is raised when a key is pressed or released. */
-	struct tinywl_keyboard *keyboard =
-		wl_container_of(listener, keyboard, key);
-	struct tinywl_server *server = keyboard->server;
-	struct wlr_keyboard_key_event *event = data;
-	struct wlr_seat *seat = server->seat;
+    // Make this keyboard active
+    wlr_seat_set_keyboard(keyboard->server->seat, keyboard->wlr_keyboard);
 
-        if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-		/* Translate libinput keycode -> xkbcommon */
-		uint32_t keycode = event->keycode + 8;
-		/* Get a list of keysyms based on the keymap for this keyboard */
-		const xkb_keysym_t *syms;
-		int nsyms = xkb_state_key_get_syms(
-				keyboard->wlr_keyboard->xkb_state, keycode, &syms);
+    // On-the-fly text input focus synchronization
+    struct wlr_surface *active_surface = keyboard->server->seat->keyboard_state.focused_surface;
+    if (active_surface != NULL && keyboard->server->text_input_mgr != NULL) {
+        struct wlr_text_input_v3 *text_input;
+        wl_list_for_each(text_input, &keyboard->server->text_input_mgr->text_inputs, link) {
+            // Find the text input struct belonging to the app holding active hardware focus
+            if (wl_resource_get_client(text_input->resource) == wl_resource_get_client(active_surface->resource)) {
+                // If it isn't already focused by the text manager, activate it!
+                if (text_input->focused_surface != active_surface) {
+                    wlr_text_input_v3_send_enter(text_input, active_surface);
+                }
+            }
+        }
+    }
 
-		uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
-		for (int i = 0; i < nsyms; i++) {
-			if(handle_keybinding(server, modifiers, syms[i])) {
-                    	return;
-			}
-		}
-	}
+    // Bypass key release events
+    if (event->state == WL_KEYBOARD_KEY_STATE_RELEASED) {
+        wlr_seat_keyboard_notify_key(keyboard->server->seat, event->time_msec, event->keycode, event->state);
+        return;
+    }
 
-	/* If key wasn't a press, or no shortcut matched, passs it on */
-	wlr_seat_set_keyboard(seat, keyboard->wlr_keyboard);
-	wlr_seat_keyboard_notify_key(seat, event->time_msec,
-			event->keycode, event->state);
+    // Parse hardware key events into mapping arrays
+    xkb_keycode_t keycode = event->keycode + 8;
+    const xkb_keysym_t *syms;
+    int nsyms = xkb_state_key_get_syms(keyboard->wlr_keyboard->xkb_state, keycode, &syms);
+    uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
+
+    // Handle keyboard shortcuts
+    for (int i = 0; i < nsyms; i++) {
+        if(handle_keybinding(keyboard->server, modifiers, syms[i])) {
+            if (keyboard->compose_state) {
+                xkb_compose_state_reset(keyboard->compose_state);
+            }
+            return; // Shortcut handled, so swallow the keypress
+        }
+    }
+
+    // Handle composing
+    if (keyboard->compose_state && nsyms == 1) {
+        xkb_compose_state_feed(keyboard->compose_state, syms[0]);
+        enum xkb_compose_status status = xkb_compose_state_get_status(keyboard->compose_state);
+        if (status == XKB_COMPOSE_COMPOSING) {
+            return; // Swallowed: Hide intermediate presses from the client
+        } 
+        if (status == XKB_COMPOSE_COMPOSED) {
+            char utf8_buf[8] = {0};
+            int len = xkb_compose_state_get_utf8(keyboard->compose_state, utf8_buf, sizeof(utf8_buf));
+
+            fprintf(stderr, "[COMPOSE DEBUG] Starting COMPOSED\n");
+
+            if (len > 0 && keyboard->server->text_input_mgr != NULL) {
+                struct wlr_text_input_v3 *text_input;
+                bool committed = false;
+
+                 wl_list_for_each(text_input, &keyboard->server->text_input_mgr->text_inputs, link) {
+                     if (wl_resource_get_client(text_input->resource) ==
+                                                wl_resource_get_client(active_surface->resource)) {
+                         wlr_text_input_v3_send_commit_string(text_input, utf8_buf);
+                         wlr_text_input_v3_send_done(text_input);
+                         committed = true;
+                         break;
+                     }
+                 }
+
+                // Fallback: If no text field is registered for this client
+                if (!committed) {
+                    wlr_seat_keyboard_notify_key(keyboard->server->seat, event->time_msec,
+                           event->keycode, event->state);
+                }
+            }
+
+            // 3. Reset the engine state machine and return early (swallowing the raw 'a' press)
+            xkb_compose_state_reset(keyboard->compose_state);
+            return;
+        }
+
+        if (status == XKB_COMPOSE_CANCELLED) {
+            xkb_compose_state_reset(keyboard->compose_state);
+        }
+    }
+
+    // ordinary key, or finish composing, and not a keyboard shortcut
+    wlr_seat_keyboard_notify_key(keyboard->server->seat, event->time_msec, event->keycode, event->state);
 }
 
 static void keyboard_handle_destroy(struct wl_listener *listener, void *data) {
@@ -345,6 +414,12 @@ static void keyboard_handle_destroy(struct wl_listener *listener, void *data) {
 	 */
 	struct tinywl_keyboard *keyboard =
 		wl_container_of(listener, keyboard, destroy);
+
+	// free compose state
+	if (keyboard->compose_state) {
+		xkb_compose_state_unref(keyboard->compose_state);
+	}
+
 	wl_list_remove(&keyboard->modifiers.link);
 	wl_list_remove(&keyboard->key.link);
 	wl_list_remove(&keyboard->destroy.link);
@@ -356,31 +431,43 @@ static void server_new_keyboard(struct tinywl_server *server,
 		struct wlr_input_device *device) {
 	struct wlr_keyboard *wlr_keyboard = wlr_keyboard_from_input_device(device);
 
+	// Allocate and initialize the tracking structure
 	struct tinywl_keyboard *keyboard = calloc(1, sizeof(*keyboard));
 	keyboard->server = server;
 	keyboard->wlr_keyboard = wlr_keyboard;
 
-	/* We need to prepare an XKB keymap and assign it to the keyboard. This
-	 * assumes the defaults (e.g. layout = "us"). */
+	// Prepare the XKB context and layout configuration rules
 	struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+	struct xkb_rule_names rules = {
+		.rules = NULL,
+		.model = NULL,
+		.layout = "us",
+		.variant = NULL,
+		.options = "compose:ralt", // Right Alt as the compose key
+	};
 
-        // Use ralt as the compose key
-        struct xkb_rule_names rules = {
-            .rules = NULL,
-            .model = NULL,
-            .layout = "us",
-            .variant = NULL,
-            .options = "compose:ralt",
-        };
-        struct xkb_keymap *keymap = xkb_keymap_new_from_names(context, &rules,
-            XKB_KEYMAP_COMPILE_NO_FLAGS);
-
+	// Compile the keymap using our options rules and assign it to the hardware
+ 	struct xkb_keymap *keymap = xkb_keymap_new_from_names(context, &rules, XKB_KEYMAP_COMPILE_NO_FLAGS);
 	wlr_keyboard_set_keymap(wlr_keyboard, keymap);
+
+	// Clean up temporary compilation memory
 	xkb_keymap_unref(keymap);
 	xkb_context_unref(context);
+
+	// Set typematic key repeat parameters
 	wlr_keyboard_set_repeat_info(wlr_keyboard, 25, 600);
 
-	/* Here we set up listeners for keyboard events. */
+	// Initialize the state machine tracker for multi-step character sequences
+        if (server->compose_table) {
+            keyboard->compose_state = xkb_compose_state_new(
+                server->compose_table,
+                XKB_COMPOSE_STATE_NO_FLAGS
+            );
+        } else {
+            keyboard->compose_state = NULL; // Safety fallback
+        }
+
+        // Hook up listeners
 	keyboard->modifiers.notify = keyboard_handle_modifiers;
 	wl_signal_add(&wlr_keyboard->events.modifiers, &keyboard->modifiers);
 	keyboard->key.notify = keyboard_handle_key;
@@ -388,9 +475,10 @@ static void server_new_keyboard(struct tinywl_server *server,
 	keyboard->destroy.notify = keyboard_handle_destroy;
 	wl_signal_add(&device->events.destroy, &keyboard->destroy);
 
+        // Set this newly plugged-in device as the primary keyboard
 	wlr_seat_set_keyboard(server->seat, keyboard->wlr_keyboard);
 
-	/* And add the keyboard to our list of keyboards */
+	// Inject our tracking instance into the server's tracking array
 	wl_list_insert(&server->keyboards, &keyboard->link);
 }
 
@@ -972,40 +1060,51 @@ int main(int argc, char *argv[]) {
 	}
 
 	struct tinywl_server server = {0};
-	/* The Wayland display is managed by libwayland. It handles accepting
-	 * clients from the Unix socket, manging Wayland globals, and so on. */
 	server.wl_display = wl_display_create();
-	/* The backend is a wlroots feature which abstracts the underlying input and
-	 * output hardware. The autocreate option will choose the most suitable
-	 * backend based on the current environment, such as opening an X11 window
-	 * if an X11 server is running. */
+
+	// Choose the most suitable backend based on the current environment
 	server.backend = wlr_backend_autocreate(server.wl_display, NULL);
 	if (server.backend == NULL) {
 		wlr_log(WLR_ERROR, "failed to create wlr_backend");
 		return 1;
 	}
 
-	/* Autocreates a renderer, either Pixman, GLES2 or Vulkan for us. The user
-	 * can also specify a renderer using the WLR_RENDERER env var.
-	 * The renderer is responsible for defining the various pixel formats it
-	 * supports for shared memory, this configures that for clients. */
+	// Create a renderer
 	server.renderer = wlr_renderer_autocreate(server.backend);
 	if (server.renderer == NULL) {
 		wlr_log(WLR_ERROR, "failed to create wlr_renderer");
 		return 1;
 	}
-
 	wlr_renderer_init_wl_display(server.renderer, server.wl_display);
 
-	/* Autocreates an allocator for us.
-	 * The allocator is the bridge between the renderer and the backend. It
-	 * handles the buffer creation, allowing wlroots to render onto the
-	 * screen */
+	// Create an allocator - the bridge between renderer and backend
 	server.allocator = wlr_allocator_autocreate(server.backend,
 		server.renderer);
 	if (server.allocator == NULL) {
 		wlr_log(WLR_ERROR, "failed to create wlr_allocator");
 		return 1;
+	}
+
+	// Instantiate the text input manager
+	server.text_input_mgr = wlr_text_input_manager_v3_create(server.wl_display);
+	if (server.text_input_mgr == NULL) {
+		wlr_log(WLR_ERROR, "Failed to create text input manager v3");
+		return 1;
+	}
+
+	// Initialize the compose table (after backend is initalized but before it is started)
+        setenv("XLOCALEDIR", "/usr/share/X11/locale", 1); // so libxkbcommon knows where to look
+	struct xkb_context *ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+	if (ctx) {
+		const char *locale = getenv("LC_ALL");
+		if (!locale) locale = getenv("LC_CTYPE");
+		if (!locale) locale = getenv("LANG");
+		if (!locale) locale = "C";
+		server.compose_table = xkb_compose_table_new_from_locale(
+			ctx, locale, XKB_COMPOSE_COMPILE_NO_FLAGS
+		);
+	} else {
+		server.compose_table = NULL;
 	}
 
 	/* This creates some hands-off wlroots interfaces. The compositor is
