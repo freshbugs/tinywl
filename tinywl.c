@@ -77,6 +77,10 @@ struct tinywl_server {
 	// for the compose key
 	struct xkb_compose_table *compose_table;
 	struct wlr_text_input_manager_v3 *text_input_mgr;
+
+	// for DnD
+	struct wl_listener request_start_drag;
+	struct wl_listener start_drag;
 };
 
 struct tinywl_output {
@@ -1039,6 +1043,27 @@ static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
 		&toplevel->request_fullscreen);
 }
 
+static void server_handle_request_start_drag(struct wl_listener *listener, void *data) {
+    struct wlr_seat_request_start_drag_event *event = data;
+    struct tinywl_server *server = wl_container_of(listener, server, request_start_drag);
+
+    // Validate the drag request (check if the serial matches an implicit mouse grab)
+    if (wlr_seat_validate_pointer_grab_serial(server->seat, event->origin, event->serial)) {
+        wlr_seat_start_pointer_drag(server->seat, event->drag, event->serial);
+    } else {
+        // Reject the drag if the serial is invalid or outdated
+        wlr_data_source_destroy(event->drag->source);
+    }
+}
+
+static void server_handle_start_drag(struct wl_listener *listener, void *data) {
+    // struct wlr_drag *drag = data;
+    // Optional: If you want to render the floating preview icon of the dragged text,
+    // you would hook into the drag surface listeners here. For now, leaving it empty
+    // lets the drag function perfectly in the background.
+}
+
+
 int main(int argc, char *argv[]) {
 	wlr_log_init(WLR_DEBUG, NULL);
 	char *startup_cmd = NULL;
@@ -1106,6 +1131,15 @@ int main(int argc, char *argv[]) {
 	} else {
 		server.compose_table = NULL;
 	}
+
+	// Instantiate the data device manager, for drag and drop
+	struct wlr_data_device_manager *data_device_manager =
+		wlr_data_device_manager_create(server.wl_display);
+	if (!data_device_manager) {
+		wlr_log(WLR_ERROR, "Failed to create data device manager");
+		return 1;
+	}
+
 
 	/* This creates some hands-off wlroots interfaces. The compositor is
 	 * necessary for clients to allocate surfaces, the subcompositor allows to
@@ -1193,6 +1227,13 @@ int main(int argc, char *argv[]) {
 	server.new_input.notify = server_new_input;
 	wl_signal_add(&server.backend->events.new_input, &server.new_input);
 	server.seat = wlr_seat_create(server.wl_display, "seat0");
+
+	// Register drag-and-drop listeners
+	server.request_start_drag.notify = server_handle_request_start_drag;
+	wl_signal_add(&server.seat->events.request_start_drag, &server.request_start_drag);
+	server.start_drag.notify = server_handle_start_drag;
+	wl_signal_add(&server.seat->events.start_drag, &server.start_drag);
+
 	server.request_cursor.notify = seat_request_cursor;
 	wl_signal_add(&server.seat->events.request_set_cursor,
 			&server.request_cursor);
