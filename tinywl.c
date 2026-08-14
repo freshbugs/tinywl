@@ -364,13 +364,13 @@ static void server_new_keyboard(struct tinywl_server *server,
 	 * assumes the defaults (e.g. layout = "us"). */
 	struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 
-        // Use ~/.confif/xkb/symbols/custom to make F23 the compose key
+        // Use ralt as the compose key
         struct xkb_rule_names rules = {
             .rules = NULL,
             .model = NULL,
-            .layout = "us,custom(compose_f23)",
+            .layout = "us",
             .variant = NULL,
-            .options = NULL,
+            .options = "compose:ralt",
         };
         struct xkb_keymap *keymap = xkb_keymap_new_from_names(context, &rules,
             XKB_KEYMAP_COMPILE_NO_FLAGS);
