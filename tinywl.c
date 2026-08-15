@@ -162,6 +162,21 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel,
                                    keyboard->keycodes, keyboard->num_keycodes,
                                    &keyboard->modifiers);
   }
+
+  // text input focus synchronization
+  if (surface != NULL && server->text_input_mgr != NULL) {
+    struct wlr_text_input_v3 *text_input;
+
+    wl_list_for_each(text_input, &server->text_input_mgr->text_inputs, link) {
+    // Find the text input struct belonging to the app holding active hardware focus
+      if (wl_resource_get_client(text_input->resource) == wl_resource_get_client(surface->resource)) {
+        // If it isn't already focused by the text manager, activate it!
+        if (text_input->focused_surface != surface) {
+          wlr_text_input_v3_send_enter(text_input, surface);
+        }
+      }
+    }
+  }
 }
 
 static void keyboard_handle_modifiers(struct wl_listener *listener,
@@ -324,24 +339,8 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
   // Make this keyboard active
   wlr_seat_set_keyboard(keyboard->server->seat, keyboard->wlr_keyboard);
 
-  // On-the-fly text input focus synchronization
   struct wlr_surface *active_surface =
       keyboard->server->seat->keyboard_state.focused_surface;
-  if (active_surface != NULL && keyboard->server->text_input_mgr != NULL) {
-    struct wlr_text_input_v3 *text_input;
-    wl_list_for_each(text_input, &keyboard->server->text_input_mgr->text_inputs,
-                     link) {
-      // Find the text input struct belonging to the app holding active hardware
-      // focus
-      if (wl_resource_get_client(text_input->resource) ==
-          wl_resource_get_client(active_surface->resource)) {
-        // If it isn't already focused by the text manager, activate it!
-        if (text_input->focused_surface != active_surface) {
-          wlr_text_input_v3_send_enter(text_input, active_surface);
-        }
-      }
-    }
-  }
 
   // Bypass key release events
   if (event->state == WL_KEYBOARD_KEY_STATE_RELEASED) {
