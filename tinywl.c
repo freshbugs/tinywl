@@ -262,6 +262,19 @@ static bool handle_media_key(uint32_t keycode, bool is_press) {
 static bool handle_quick_key(struct tinywl_server *server,
                              uint32_t modifiers,
                              uint32_t sym) {
+  // TTY switching on ctrl+alt+Fn
+  // We don't need to check the modifiers - they make the keycode XF86Switch_VT_n
+  uint32_t tty_number = 1 + sym - XKB_KEY_XF86Switch_VT_1;
+  if (tty_number >= 1 && tty_number <= 6) {
+    // Look up the active session directly from our global server structure
+    if (server->session != NULL) {
+      wlr_log(WLR_INFO, "Switching to TTY %d via server state", tty_number);
+      wlr_session_change_vt(server->session, tty_number);
+    }
+    return true; // Swallowed cleanly
+  }
+
+  // Other LOG+key
   if (modifiers == WLR_MODIFIER_LOGO) {
     switch (sym) {
         case XKB_KEY_Return:
@@ -283,24 +296,6 @@ static bool handle_quick_key(struct tinywl_server *server,
           break;
      }
   }
-
-  // TTY switching
-  uint32_t ctrl_alt = (WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT);
-  if ((modifiers & ctrl_alt) == ctrl_alt) {
-    if (sym >= XKB_KEY_F1 && sym <= XKB_KEY_F6) {
-      uint32_t tty_number = 1 + sym - XKB_KEY_F1;
-      
-      // Look up the active session directly from our global server structure!
-      struct wlr_session *session = server->session;
-      
-      if (session != NULL) {
-        wlr_log(WLR_INFO, "Switching to TTY %d via server state", tty_number);
-        wlr_session_change_vt(session, tty_number);
-      }
-      return true; // Swallowed cleanly
-    }
-  }
-
 
   return false;
 }
