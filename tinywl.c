@@ -26,10 +26,15 @@
 #include <wlr/util/log.h>
 #include <xkbcommon/xkbcommon.h>
 
-#include <wlr/types/wlr_text_input_v3.h> // for zwp_text_input_manaer_v3, for compose
-#include <xkbcommon/xkbcommon-compose.h> // for compose
+// for compose and zwp_text_input_manaer_v3
+#include <wlr/types/wlr_text_input_v3.h> 
+#include <xkbcommon/xkbcommon-compose.h>
 
-#include <libinput.h> // for tap-to-click
+// For TTY switching
+#include <wlr/backend/session.h>
+
+// for tap-to-click
+#include <libinput.h>
 #include <wlr/backend/libinput.h>
 
 /* For brevity's sake, struct members are annotated where they are used. */
@@ -42,6 +47,7 @@ enum tinywl_cursor_mode {
 struct tinywl_server {
   struct wl_display *wl_display;
   struct wlr_backend *backend;
+  struct wlr_session *session; // added
   struct wlr_renderer *renderer;
   struct wlr_allocator *allocator;
   struct wlr_scene *scene;
@@ -104,8 +110,6 @@ struct tinywl_toplevel {
   struct wl_listener request_resize;
   struct wl_listener request_maximize;
   struct wl_listener request_fullscreen;
-
-  float opacity;
 };
 
 struct tinywl_keyboard {
@@ -118,6 +122,8 @@ struct tinywl_keyboard {
   struct wl_listener destroy;
 
   struct xkb_compose_state *compose_state;
+
+  uint32_t grabbed_keycode;  // keypress that we did not tell the client
 };
 
 static void focus_toplevel(struct tinywl_toplevel *toplevel,
@@ -144,6 +150,15 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel,
     if (prev_toplevel != NULL) {
       wlr_xdg_toplevel_set_activated(prev_toplevel, false);
     }
+    // Clear virtual text input focus for the old surface
+    if (server->text_input_mgr != NULL) {
+      struct wlr_text_input_v3 *text_input;
+      wl_list_for_each(text_input, &server->text_input_mgr->text_inputs, link) {
+        if (text_input->focused_surface == prev_surface) {
+          wlr_text_input_v3_send_leave(text_input);
+        }
+      }
+    }
   }
   struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
   /* Move the toplevel to the front */
@@ -152,6 +167,12 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel,
   wl_list_insert(&server->toplevels, &toplevel->link);
   /* Activate the new surface */
   wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
+  // There are no "grabbed" keys anymore
+  struct tinywl_keyboard *kbd;
+  wl_list_for_each(kbd, &server->keyboards, link) {
+    kbd->grabbed_keycode = 0;
+  }
+
   /*
    * Tell the seat to have the keyboard enter this surface. wlroots will keep
    * track of this and automatically send key events to the appropriate
@@ -162,14 +183,13 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel,
                                    keyboard->keycodes, keyboard->num_keycodes,
                                    &keyboard->modifiers);
   }
-
   // text input focus synchronization
   if (surface != NULL && server->text_input_mgr != NULL) {
     struct wlr_text_input_v3 *text_input;
-
     wl_list_for_each(text_input, &server->text_input_mgr->text_inputs, link) {
-    // Find the text input struct belonging to the app holding active hardware focus
-      if (wl_resource_get_client(text_input->resource) == wl_resource_get_client(surface->resource)) {
+    // Find the text input struct for the app holding active hardware focus
+      if (wl_resource_get_client(text_input->resource) ==
+          wl_resource_get_client(surface->resource)) {
         // If it isn't already focused by the text manager, activate it!
         if (text_input->focused_surface != surface) {
           wlr_text_input_v3_send_enter(text_input, surface);
@@ -197,224 +217,169 @@ static void keyboard_handle_modifiers(struct wl_listener *listener,
                                      &keyboard->wlr_keyboard->modifiers);
 }
 
-/* keybindings */
-
-/* First a bunch of functions that will handle them */
-
+// spawn a shell process - useful for keybindings
 static void spawn(const char *cmd) {
-  // A standard "grandchild" fork trick makes systemd deal with cleanup
+  // A standard doule-fork trick makes systemd deal with cleanup.
+  // The grandchild becomes an orphan, so gets adopted by systemd.
   if (fork() == 0) {
     if (fork() == 0) {
       execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+      wlr_log(WLR_ERROR, "spawn: execl failed: %s", strerror(errno));
       _exit(1); // if execl fails for some reason (rare)
     }
     _exit(0);
   }
 }
 
-static void handle_exit(struct tinywl_server *server) {
-  wl_display_terminate(server->wl_display);
-}
-
-static void handle_cycle_window(struct tinywl_server *server) {
-  if (wl_list_length(&server->toplevels) < 2) {
-    return;
-  }
-  struct tinywl_toplevel *next_toplevel =
-      wl_container_of(server->toplevels.prev, next_toplevel, link);
-  focus_toplevel(next_toplevel, next_toplevel->xdg_toplevel->base->surface);
-}
-
-static void handle_terminal(struct tinywl_server *server) { spawn("foot"); }
-
-static void handle_run(struct tinywl_server *server) {
-  spawn("cmd=$(zenity --entry) && eval 'exec $cmd'");
-}
-
-/* Helper function. Must be of a certain type. */
-static void set_opacity_iterator(struct wlr_scene_buffer *buffer, int sx,
-                                 int sy, void *data) {
-  (void)sx;
-  (void)sy;
-  float *opacity = data;
-  wlr_scene_buffer_set_opacity(buffer, *opacity);
-}
-
-/* Toggle the opacity of the focused window.
- * This makes some simplifying assumptions that are true for now:
- *  - this is the only function altering opacities,
- *  - the focused window is first in the toplevels list, and
- *  - we want the window to keep its opacity as-is when it loses focus. */
-static void handle_toggle_opacity(struct tinywl_server *server) {
-  if (wl_list_empty(&server->toplevels)) {
-    return;
-  }
-
-  struct tinywl_toplevel *toplevel =
-      wl_container_of(server->toplevels.next, toplevel, link);
-
-  toplevel->opacity = toplevel->opacity > 0.6 ? 0.4 : 1.0;
-
-  wlr_scene_node_for_each_buffer(&toplevel->scene_tree->node,
-                                 set_opacity_iterator, &toplevel->opacity);
-}
-
-// media key functions
-
-static void handle_volume_toggle_mute(struct tinywl_server *server) {
-  spawn("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle");
-}
-
-static void handle_volume_down(struct tinywl_server *server) {
-  spawn("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-");
-}
-
-static void handle_volume_up(struct tinywl_server *server) {
-  spawn("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+ -l 1.0");
-}
-
-static void handle_toggle_mic_mute(struct tinywl_server *server) {
-  spawn("amixer set Capture toggle");
-}
-
-static void handle_brightness_up(struct tinywl_server *server) {
-  spawn("brightnessctl set 1%+");
-}
-
-static void handle_brightness_down(struct tinywl_server *server) {
-  spawn("brightnessctl set 1%-");
-}
-
-static void handle_toggle_pause(struct tinywl_server *server) {
-  spawn("playerctl play-pause");
-}
-
-/* Put the functions in an array */
-
-struct keybinding {
-  uint32_t modifiers; // bit array for Alt etc.
-  xkb_keysym_t sym;
-  void (*handler)(struct tinywl_server *server);
-};
-
-static const struct keybinding keybindings[] = {
-    {WLR_MODIFIER_LOGO, XKB_KEY_Escape, handle_exit},
-    {WLR_MODIFIER_LOGO, XKB_KEY_Tab, handle_cycle_window},
-    {WLR_MODIFIER_LOGO, XKB_KEY_Return, handle_terminal},
-    {WLR_MODIFIER_LOGO, XKB_KEY_r, handle_run},
-    {WLR_MODIFIER_LOGO, XKB_KEY_o, handle_toggle_opacity},
-
-    /* media keys */
-    {0, XKB_KEY_XF86AudioRaiseVolume, handle_volume_up},
-    {0, XKB_KEY_XF86AudioLowerVolume, handle_volume_down},
-    {0, XKB_KEY_XF86AudioMute, handle_volume_toggle_mute},
-    {0, XKB_KEY_XF86AudioMicMute, handle_toggle_mic_mute},
-    {0, XKB_KEY_XF86MonBrightnessUp, handle_brightness_up},
-    {0, XKB_KEY_XF86MonBrightnessDown, handle_brightness_down},
-    {0, XKB_KEY_XF86Favorites, handle_toggle_pause},
-};
-
-static bool handle_keybinding(struct tinywl_server *server,
-                              uint32_t current_modifiers, xkb_keysym_t sym) {
-  size_t num_bindings = sizeof(keybindings) / sizeof(keybindings[0]);
-
-  for (size_t i = 0; i < num_bindings; i++) {
-    if (~current_modifiers & keybindings[i].modifiers) {
-      // Move on if some needed modifier key is NOT held down.
-      // We don't care if extra modifier keys are held down.
-      continue;
-    }
-    if (keybindings[i].sym == sym) {
-      keybindings[i].handler(server);
+static bool handle_media_key(uint32_t keycode, bool is_press) {
+  switch (keycode) {
+    case XKB_KEY_XF86AudioMute:
+      if (is_press) spawn("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle");
       return true;
+    case XKB_KEY_XF86AudioLowerVolume:
+      if (is_press) spawn("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-");
+      return true;
+    case XKB_KEY_XF86AudioRaiseVolume:
+      if (is_press) spawn("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+ -l 1.0");
+      return true;
+    case XKB_KEY_XF86AudioMicMute:
+      if (is_press) spawn("amixer set Capture toggle");
+      return true;
+    case XKB_KEY_XF86MonBrightnessDown:
+      if (is_press) spawn("brightnessctl set 1%-");
+      return true;
+    case XKB_KEY_XF86MonBrightnessUp:
+      if (is_press) spawn("brightnessctl set 1%+");
+      return true;
+    case XKB_KEY_XF86Favorites:
+      if (is_press) spawn("playerctl play-pause");
+      return true;
+    default:
+      return false; // Not a (handled) media key
+  }
+}
+
+static bool handle_quick_key(struct tinywl_server *server,
+                             uint32_t modifiers,
+                             uint32_t sym) {
+  if (modifiers == WLR_MODIFIER_LOGO) {
+    switch (sym) {
+        case XKB_KEY_Return:
+          spawn("foot");
+          return true;
+        case XKB_KEY_Escape:
+          wl_display_terminate(server->wl_display);
+          return true;
+        case XKB_KEY_Tab:
+          if (wl_list_length(&server->toplevels) > 1) {
+            struct tinywl_toplevel *next_toplevel = 
+                wl_container_of(server->toplevels.next->next, next_toplevel,
+                                link);
+            focus_toplevel(next_toplevel,
+                           next_toplevel->xdg_toplevel->base->surface);
+            }
+          return true;
+        default:
+          break;
+     }
+  }
+
+  // TTY switching
+  uint32_t ctrl_alt = (WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT);
+  if ((modifiers & ctrl_alt) == ctrl_alt) {
+    if (sym >= XKB_KEY_F1 && sym <= XKB_KEY_F6) {
+      uint32_t tty_number = 1 + sym - XKB_KEY_F1;
+      
+      // Look up the active session directly from our global server structure!
+      struct wlr_session *session = server->session;
+      
+      if (session != NULL) {
+        wlr_log(WLR_INFO, "Switching to TTY %d via server state", tty_number);
+        wlr_session_change_vt(session, tty_number);
+      }
+      return true; // Swallowed cleanly
     }
   }
-  return false; /* No keybinding applies, let the client handle it */
+
+
+  return false;
+}
+
+// keys handled by the compositor, as opposed to the client
+static bool handle_compositor_key(struct tinywl_keyboard *keyboard,
+    struct wlr_keyboard_key_event *event) {
+  // sanity check
+  if (event->keycode == 0) {
+    return false;
+  }
+  // ensure the XKB state machine is ready
+  if (keyboard->wlr_keyboard == NULL ||
+      keyboard->wlr_keyboard->xkb_state == NULL) {
+    return false; // Skip compositor checks if state isn't initialized yet
+  }
+
+  // Apply the +8 offset and get the symbol corresponding to the keycode
+  uint32_t sym = xkb_state_key_get_one_sym(keyboard->wlr_keyboard->xkb_state,
+                                           event->keycode + 8);
+  uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
+  bool is_press = (event->state == WL_KEYBOARD_KEY_STATE_PRESSED);
+
+  // Handle media keys (press or release)
+  if (handle_media_key(sym, is_press)) {
+    return true; 
+  }
+
+  // Grab a release it if and only if the corresponding press was grabbed
+  if (!is_press) {
+    if (event->keycode == keyboard->grabbed_keycode) {
+      keyboard->grabbed_keycode = 0; 
+      return true; 
+    }
+    return false; 
+  }
+
+  // If a key is already grabbed, don't grab another
+  if (keyboard->grabbed_keycode != 0) {
+    return false; 
+  }
+
+  // Quick keys
+  if (handle_quick_key(keyboard->server, modifiers, sym)) {
+    keyboard->grabbed_keycode = event->keycode;
+    return true; 
+  }
+
+  return false; 
 }
 
 static void keyboard_handle_key(struct wl_listener *listener, void *data) {
   struct tinywl_keyboard *keyboard = wl_container_of(listener, keyboard, key);
   struct wlr_keyboard_key_event *event = data;
 
-  // Make this keyboard active
-  wlr_seat_set_keyboard(keyboard->server->seat, keyboard->wlr_keyboard);
-
-  struct wlr_surface *active_surface =
-      keyboard->server->seat->keyboard_state.focused_surface;
-
-  // Bypass key release events
-  if (event->state == WL_KEYBOARD_KEY_STATE_RELEASED) {
-    wlr_seat_keyboard_notify_key(keyboard->server->seat, event->time_msec,
-                                 event->keycode, event->state);
+  // sanity check
+  if (keyboard == NULL ||
+      keyboard->server == NULL ||
+      keyboard->wlr_keyboard == NULL) {
     return;
   }
 
-  // Parse hardware key events into mapping arrays
-  xkb_keycode_t keycode = event->keycode + 8;
-  const xkb_keysym_t *syms;
-  int nsyms =
-      xkb_state_key_get_syms(keyboard->wlr_keyboard->xkb_state, keycode, &syms);
-  uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
+  // Ensure the seat knows which hardware keyboard is active
+  wlr_seat_set_keyboard(keyboard->server->seat, keyboard->wlr_keyboard);
 
-  // Handle keyboard shortcuts
-  for (int i = 0; i < nsyms; i++) {
-    if (handle_keybinding(keyboard->server, modifiers, syms[i])) {
-      if (keyboard->compose_state) {
-        xkb_compose_state_reset(keyboard->compose_state);
-      }
-      return; // Shortcut handled, so swallow the keypress
-    }
+  // Intercept Phase: Let the compositor process internal hotkeys/media keys.
+  // handle_compositor_key manages the +8 XKB offset, filters shortcuts, 
+  // and locks down our grabbed_keycode tracking state.
+  if (handle_compositor_key(keyboard, event)) {
+    return;
   }
 
-  // Handle composing
-  if (keyboard->compose_state && nsyms == 1) {
-    xkb_compose_state_feed(keyboard->compose_state, syms[0]);
-    enum xkb_compose_status status =
-        xkb_compose_state_get_status(keyboard->compose_state);
-    if (status == XKB_COMPOSE_COMPOSING) {
-      return; // Swallowed: Hide intermediate presses from the client
-    }
-    if (status == XKB_COMPOSE_COMPOSED) {
-      char utf8_buf[8] = {0};
-      int len = xkb_compose_state_get_utf8(keyboard->compose_state, utf8_buf,
-                                           sizeof(utf8_buf));
-
-      fprintf(stderr, "[COMPOSE DEBUG] Starting COMPOSED\n");
-
-      if (len > 0 && keyboard->server->text_input_mgr != NULL) {
-        struct wlr_text_input_v3 *text_input;
-        bool committed = false;
-
-        wl_list_for_each(text_input,
-                         &keyboard->server->text_input_mgr->text_inputs, link) {
-          if (wl_resource_get_client(text_input->resource) ==
-              wl_resource_get_client(active_surface->resource)) {
-            wlr_text_input_v3_send_commit_string(text_input, utf8_buf);
-            wlr_text_input_v3_send_done(text_input);
-            committed = true;
-            break;
-          }
-        }
-
-        // Fallback: If no text field is registered for this client
-        if (!committed) {
-          wlr_seat_keyboard_notify_key(keyboard->server->seat, event->time_msec,
-                                       event->keycode, event->state);
-        }
-      }
-
-      // 3. Reset the engine state machine and return early (swallowing the raw
-      // 'a' press)
-      xkb_compose_state_reset(keyboard->compose_state);
-      return;
-    }
-
-    if (status == XKB_COMPOSE_CANCELLED) {
-      xkb_compose_state_reset(keyboard->compose_state);
-    }
+  // Compose
+  if (keyboard->compose_state != NULL &&
+      event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+    xkb_compose_state_feed(keyboard->compose_state, event->keycode + 8);
   }
 
-  // ordinary key, or finish composing, and not a keyboard shortcut
+  // Forward standard typing events straight to the application client
   wlr_seat_keyboard_notify_key(keyboard->server->seat, event->time_msec,
                                event->keycode, event->state);
 }
@@ -447,6 +412,7 @@ static void server_new_keyboard(struct tinywl_server *server,
   struct tinywl_keyboard *keyboard = calloc(1, sizeof(*keyboard));
   keyboard->server = server;
   keyboard->wlr_keyboard = wlr_keyboard;
+  // keyboard->grabbed_keycode = 0 is automatic because of calloc
 
   // Prepare the XKB context and layout configuration rules
   struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
@@ -1026,8 +992,6 @@ static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
   struct tinywl_toplevel *toplevel = calloc(1, sizeof(*toplevel));
   toplevel->server = server;
   toplevel->xdg_toplevel = xdg_surface->toplevel;
-  toplevel->opacity =
-      1.0f; // added: keep local opacities to give to the renderer
 
   toplevel->scene_tree = wlr_scene_xdg_surface_create(
       &toplevel->server->scene->tree, toplevel->xdg_toplevel->base);
@@ -1105,7 +1069,7 @@ int main(int argc, char *argv[]) {
   server.wl_display = wl_display_create();
 
   // Choose the most suitable backend based on the current environment
-  server.backend = wlr_backend_autocreate(server.wl_display, NULL);
+  server.backend = wlr_backend_autocreate(server.wl_display, &server.session);
   if (server.backend == NULL) {
     wlr_log(WLR_ERROR, "failed to create wlr_backend");
     return 1;
