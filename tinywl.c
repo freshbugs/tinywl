@@ -119,41 +119,53 @@ struct tinywl_keyboard {
 // Move keyboard and visual focus to a toplevel and a surface inside it
 static void focus_toplevel(struct tinywl_toplevel *toplevel,
                            struct wlr_surface *surface) {
-  if (toplevel == NULL) {
+  if (toplevel == NULL || surface == NULL) {
     return;
   }
+  
   struct tinywl_server *server = toplevel->server;
   struct wlr_seat *seat = server->seat;
   struct wlr_surface *prev_surface = seat->keyboard_state.focused_surface;
+  
   if (prev_surface == surface) {
     /* Don't re-focus an already focused surface. */
     return;
   }
+  
+  // Deactivate the old surface's toplevel if it exists
   if (prev_surface) {
-    /*
-     * Deactivate the previously focused surface. This lets the client know
-     * it no longer has focus and the client will repaint accordingly, e.g.
-     * stop displaying a caret.
-     */
     struct wlr_xdg_toplevel *prev_toplevel =
         wlr_xdg_toplevel_try_from_wlr_surface(prev_surface);
     if (prev_toplevel != NULL) {
       wlr_xdg_toplevel_set_activated(prev_toplevel, false);
     }
+    // Note: xdg_toplevel_try... will return NULL from a popup, resulting in a visual glitch
+    // Ideally, climb the protocol tree to find the toplevel
   }
 
-  /*
-   * Tell the seat to have the keyboard enter this surface. wlroots will keep
-   * track of this and automatically send key events to the appropriate
-   * clients without additional work on your part.
-   */
+  // Raise it in the scene tree and in our toplevel list
+  wlr_scene_node_raise_to_top(&toplevel->scene_tree->node);
+  wl_list_remove(&toplevel->link);
+  wl_list_insert(&server->toplevels, &toplevel->link);
+
+  // Clear grabbed keys
+  struct tinywl_keyboard *kbd;
+  wl_list_for_each(kbd, &server->keyboards, link) {
+    kbd->grabbed_keycode = 0;
+  }
+
+  // Activate the new toplevel window visually
+  wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
+
+  // Send keyboard enter to the exact surface requested
   struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
   if (keyboard != NULL) {
-    wlr_seat_keyboard_notify_enter(seat, toplevel->xdg_toplevel->base->surface,
+    wlr_seat_keyboard_notify_enter(seat, surface,
                                    keyboard->keycodes, keyboard->num_keycodes,
                                    &keyboard->modifiers);
   }
 }
+
 
 static void keyboard_handle_modifiers(struct wl_listener *listener,
                                       void *data) {
