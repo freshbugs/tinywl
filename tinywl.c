@@ -28,6 +28,7 @@
 
 // for compose and zwp_text_input_manaer_v3
 #include <xkbcommon/xkbcommon-compose.h>
+#include <wlr/types/wlr_text_input_v3.h>
 
 // For TTY switching
 #include <wlr/backend/session.h>
@@ -81,6 +82,7 @@ struct tinywl_server {
 
   // for the compose key
   struct wlr_text_input_manager_v3 *text_input_mgr;
+  struct xkb_context *xkb_context;
 
   // for DnD
   struct wl_listener request_start_drag;
@@ -1040,30 +1042,19 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  // Initialize the compose table (after backend is initalized but before it is
-  // started)
-  setenv("XLOCALEDIR", "/usr/share/X11/locale",
-         1); // so libxkbcommon knows where to look
-  struct xkb_context *ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-  if (ctx) {
-    const char *locale = getenv("LC_ALL");
-    if (!locale)
-      locale = getenv("LC_CTYPE");
-    if (!locale)
-      locale = getenv("LANG");
-    if (!locale)
-      locale = "C";
-    server.compose_table = xkb_compose_table_new_from_locale(
-        ctx, locale, XKB_COMPOSE_COMPILE_NO_FLAGS);
-  } else {
-    server.compose_table = NULL;
+  // Initialize one shared XKB context for the whole server lifetime
+  server.xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+  if (server.xkb_context == NULL) {
+    wlr_log(WLR_ERROR, "Failed to create XKB context");
+    return 1;
   }
 
-  // Instantiate the data device manager, for drag and drop
+  // Instantiate the data device manager for copy/paste and drag-and-drop
   struct wlr_data_device_manager *data_device_manager =
       wlr_data_device_manager_create(server.wl_display);
-  if (!data_device_manager) {
+  if (data_device_manager == NULL) {
     wlr_log(WLR_ERROR, "Failed to create data device manager");
+    xkb_context_unref(server.xkb_context); // clean up before exiting
     return 1;
   }
 
