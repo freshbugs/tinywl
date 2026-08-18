@@ -126,9 +126,9 @@ struct tinywl_keyboard {
   uint32_t grabbed_keycode;  // keypress that we did not tell the client
 };
 
+// Move keyboard and visual focus to a toplevel and a surface inside it
 static void focus_toplevel(struct tinywl_toplevel *toplevel,
                            struct wlr_surface *surface) {
-  /* Note: this function only deals with keyboard focus. */
   if (toplevel == NULL) {
     return;
   }
@@ -231,150 +231,110 @@ static void spawn(const char *cmd) {
   }
 }
 
-static bool handle_media_key(uint32_t keycode, bool is_press) {
-  switch (keycode) {
+static bool handle_media_key(uint32_t sym) {
+  switch (sym) {
     case XKB_KEY_XF86AudioMute:
-      if (is_press) spawn("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle");
+      spawn("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle");
       return true;
     case XKB_KEY_XF86AudioLowerVolume:
-      if (is_press) spawn("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-");
+      spawn("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-");
       return true;
     case XKB_KEY_XF86AudioRaiseVolume:
-      if (is_press) spawn("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+ -l 1.0");
+      spawn("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+ -l 1.0");
       return true;
     case XKB_KEY_XF86AudioMicMute:
-      if (is_press) spawn("amixer set Capture toggle");
+      spawn("amixer set Capture toggle");
       return true;
     case XKB_KEY_XF86MonBrightnessDown:
-      if (is_press) spawn("brightnessctl set 1%-");
+      spawn("brightnessctl set 1%-");
       return true;
     case XKB_KEY_XF86MonBrightnessUp:
-      if (is_press) spawn("brightnessctl set 1%+");
+      spawn("brightnessctl set 1%+");
       return true;
     case XKB_KEY_XF86Favorites:
-      if (is_press) spawn("playerctl play-pause");
+      spawn("playerctl play-pause");
       return true;
     default:
-      return false; // Not a (handled) media key
+      return false; // Not a handled media key
   }
 }
 
-static bool handle_quick_key(struct tinywl_server *server,
-                             uint32_t modifiers,
-                             uint32_t sym) {
-  // TTY switching on ctrl+alt+Fn
-  // We don't need to check the modifiers - they make the keycode XF86Switch_VT_n
-  uint32_t tty_number = 1 + sym - XKB_KEY_XF86Switch_VT_1;
-  if (tty_number >= 1 && tty_number <= 6) {
+// This function assumes a key was pressed
+// Ctrl+Alt+Fn is mapped to XKB_KEY_XF86Switch_VT_n, and switches virtual terminals
+static bool handle_switch_vt_key(struct tinywl_server *server, uint32_t sym) {
+  uint32_t vt_number = 1 + sym - XKB_KEY_XF86Switch_VT_1;
+  if (vt_number >= 1 && vt_number <= 6) {
     // Look up the active session directly from our global server structure
     if (server->session != NULL) {
-      wlr_log(WLR_INFO, "Switching to TTY %d via server state", tty_number);
-      wlr_session_change_vt(server->session, tty_number);
+      wlr_log(WLR_INFO, "Switching to TTY %d via server state", vt_number);
+      wlr_session_change_vt(server->session, vt_number);
     }
     return true; // Swallowed cleanly
   }
-
-  // Other LOG+key
-  if (modifiers == WLR_MODIFIER_LOGO) {
-    switch (sym) {
-        case XKB_KEY_Return:
-          spawn("foot");
-          return true;
-        case XKB_KEY_Escape:
-          wl_display_terminate(server->wl_display);
-          return true;
-        case XKB_KEY_Tab:
-          if (wl_list_length(&server->toplevels) > 1) {
-            struct tinywl_toplevel *next_toplevel = 
-                wl_container_of(server->toplevels.next->next, next_toplevel,
-                                link);
-            focus_toplevel(next_toplevel,
-                           next_toplevel->xdg_toplevel->base->surface);
-            }
-          return true;
-        default:
-          break;
-     }
-  }
-
   return false;
 }
 
-// keys handled by the compositor, as opposed to the client
-static bool handle_compositor_key(struct tinywl_keyboard *keyboard,
-    struct wlr_keyboard_key_event *event) {
-  // sanity check
-  if (event->keycode == 0) {
-    return false;
+// This function assumes LOGO is held down and a key is pressed
+static bool handle_quick_key(struct tinywl_server *server, uint32_t sym) {
+  switch (sym) {
+      case XKB_KEY_Return:
+        spawn("foot");
+        return true;
+      case XKB_KEY_Escape:
+        wl_display_terminate(server->wl_display);
+        return true;
+      case XKB_KEY_Tab:
+        if (wl_list_length(&server->toplevels) > 1) {
+          struct tinywl_toplevel *next_toplevel = wl_container_of(server->toplevels.prev, next_toplevel, link);
+          focus_toplevel(next_toplevel, next_toplevel->xdg_toplevel->base->surface);
+        }
+        return true;
+      default:
+        break;
   }
-  // ensure the XKB state machine is ready
-  if (keyboard->wlr_keyboard == NULL ||
-      keyboard->wlr_keyboard->xkb_state == NULL) {
-    return false; // Skip compositor checks if state isn't initialized yet
-  }
-
-  // Apply the +8 offset and get the symbol corresponding to the keycode
-  uint32_t sym = xkb_state_key_get_one_sym(keyboard->wlr_keyboard->xkb_state,
-                                           event->keycode + 8);
-  uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
-  bool is_press = (event->state == WL_KEYBOARD_KEY_STATE_PRESSED);
-
-  // Handle media keys (press or release)
-  if (handle_media_key(sym, is_press)) {
-    return true; 
-  }
-
-  // Grab a release it if and only if the corresponding press was grabbed
-  if (!is_press) {
-    if (event->keycode == keyboard->grabbed_keycode) {
-      keyboard->grabbed_keycode = 0; 
-      return true; 
-    }
-    return false; 
-  }
-
-  // If a key is already grabbed, don't grab another
-  if (keyboard->grabbed_keycode != 0) {
-    return false; 
-  }
-
-  // Quick keys
-  if (handle_quick_key(keyboard->server, modifiers, sym)) {
-    keyboard->grabbed_keycode = event->keycode;
-    return true; 
-  }
-
-  return false; 
+  return false;
 }
+
 
 static void keyboard_handle_key(struct wl_listener *listener, void *data) {
   struct tinywl_keyboard *keyboard = wl_container_of(listener, keyboard, key);
   struct wlr_keyboard_key_event *event = data;
 
   // sanity check
-  if (keyboard == NULL ||
-      keyboard->server == NULL ||
-      keyboard->wlr_keyboard == NULL) {
-    return;
-  }
+  if (keyboard == NULL) return;
+  if (keyboard->server == NULL) return;
+  if (keyboard->wlr_keyboard == NULL) return;
+  if (keyboard->wlr_keyboard->xkb_state == NULL) return;
+  if (event->keycode == 0) return;
 
   // Ensure the seat knows which hardware keyboard is active
   wlr_seat_set_keyboard(keyboard->server->seat, keyboard->wlr_keyboard);
 
-  // Intercept Phase: Let the compositor process internal hotkeys/media keys.
-  // handle_compositor_key manages the +8 XKB offset, filters shortcuts, 
-  // and locks down our grabbed_keycode tracking state.
-  if (handle_compositor_key(keyboard, event)) {
+  // Grab a release it if and only if the corresponding press was grabbed
+  if (event->state == WL_KEYBOARD_KEY_STATE_RELEASED &&
+      event->keycode == keyboard->grabbed_keycode) {
+    event->keycode = 0;
     return;
   }
 
-  // Compose
-  if (keyboard->compose_state != NULL &&
-      event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-    xkb_compose_state_feed(keyboard->compose_state, event->keycode + 8);
+  // Return early if the compositor should grab and act on a keypress
+  if (keyboard->grabbed_keycode == 0) {
+    uint32_t sym = xkb_state_key_get_one_sym(keyboard->wlr_keyboard->xkb_state, event->keycode + 8);
+    uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
+    if (handle_media_key(sym)) {
+      return;
+    }
+    if (handle_switch_vt_key(keyboard->server, sym)) {
+      return;
+    }
+    if (modifiers & WLR_MODIFIER_LOGO == WLR_MODIFIER_LOGO) {
+      if (handle_quick_key(keyboard->server, sym)) {
+        return;
+      }
+    }
   }
 
-  // Forward standard typing events straight to the application client
+  // Otherwise, forward standard typing events to the client
   wlr_seat_keyboard_notify_key(keyboard->server->seat, event->time_msec,
                                event->keycode, event->state);
 }
