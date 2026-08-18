@@ -1,0 +1,18 @@
+#!/bin/sh
+# /usr/local/bin/tinywl-run
+
+# Export standard D-Bus variable if not present, to appease Snaps
+if [ -z "$DBUS_SESSION_BUS_ADDRESS" ]; then
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+fi
+
+# export desktop variables
+export XDG_CURRENT_DESKTOP=tinywl
+export XDG_SESSION_TYPE=wayland
+export XDG_DATA_DIRS=/usr/local/share:/usr/share
+export XMODIFIERS=@im=fcitx
+export KEYBOARD_DEFAULT_IM_MODULE=fcitx
+
+(sleep 0.5 && fcitx5 -d) &
+
+exec /home/stephen/tinywl/tinywl -s /home/stephen/tinywl/tinywl-init.sh 2>/home/stephen/tinywl.log
