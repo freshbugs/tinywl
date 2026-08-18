@@ -27,7 +27,6 @@
 #include <xkbcommon/xkbcommon.h>
 
 // for compose and zwp_text_input_manaer_v3
-#include <wlr/types/wlr_text_input_v3.h> 
 #include <xkbcommon/xkbcommon-compose.h>
 
 // For TTY switching
@@ -81,7 +80,6 @@ struct tinywl_server {
   struct wl_listener new_output;
 
   // for the compose key
-  struct xkb_compose_table *compose_table;
   struct wlr_text_input_manager_v3 *text_input_mgr;
 
   // for DnD
@@ -120,8 +118,6 @@ struct tinywl_keyboard {
   struct wl_listener modifiers;
   struct wl_listener key;
   struct wl_listener destroy;
-
-  struct xkb_compose_state *compose_state;
 
   uint32_t grabbed_keycode;  // keypress that we did not tell the client
 };
@@ -262,9 +258,10 @@ static bool handle_media_key(uint32_t sym) {
 // This function assumes a key was pressed
 // Ctrl+Alt+Fn is mapped to XKB_KEY_XF86Switch_VT_n, and switches virtual terminals
 static bool handle_switch_vt_key(struct tinywl_server *server, uint32_t sym) {
-  uint32_t vt_number = 1 + sym - XKB_KEY_XF86Switch_VT_1;
-  if (vt_number >= 1 && vt_number <= 6) {
-    // Look up the active session directly from our global server structure
+  // VT_1 through VT_4 are perfectly contiguous
+  if (sym >= XKB_KEY_XF86Switch_VT_1 && sym <= XKB_KEY_XF86Switch_VT_4) {
+    uint32_t vt_number = 1 + (sym - XKB_KEY_XF86Switch_VT_1);
+
     if (server->session != NULL) {
       wlr_log(WLR_INFO, "Switching to TTY %d via server state", vt_number);
       wlr_session_change_vt(server->session, vt_number);
@@ -274,23 +271,25 @@ static bool handle_switch_vt_key(struct tinywl_server *server, uint32_t sym) {
   return false;
 }
 
+
+
 // This function assumes LOGO is held down and a key is pressed
 static bool handle_quick_key(struct tinywl_server *server, uint32_t sym) {
   switch (sym) {
-      case XKB_KEY_Return:
-        spawn("foot");
-        return true;
-      case XKB_KEY_Escape:
-        wl_display_terminate(server->wl_display);
-        return true;
-      case XKB_KEY_Tab:
-        if (wl_list_length(&server->toplevels) > 1) {
-          struct tinywl_toplevel *next_toplevel = wl_container_of(server->toplevels.prev, next_toplevel, link);
-          focus_toplevel(next_toplevel, next_toplevel->xdg_toplevel->base->surface);
-        }
-        return true;
-      default:
-        break;
+    case XKB_KEY_Return:
+      spawn("foot");
+      return true;
+    case XKB_KEY_Escape:
+      wl_display_terminate(server->wl_display);
+      return true;
+    case XKB_KEY_Tab:
+      if (wl_list_length(&server->toplevels) > 1) {
+        struct tinywl_toplevel *next_toplevel = wl_container_of(server->toplevels.prev, next_toplevel, link);
+        focus_toplevel(next_toplevel, next_toplevel->xdg_toplevel->base->surface);
+      }
+      return true;
+    default:
+      break;
   }
   return false;
 }
@@ -313,11 +312,11 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
   // Grab a release it if and only if the corresponding press was grabbed
   if (event->state == WL_KEYBOARD_KEY_STATE_RELEASED &&
       event->keycode == keyboard->grabbed_keycode) {
-    event->keycode = 0;
+    keyboard->grabbed_keycode = 0;
     return;
   }
 
-  // Return early if the compositor should grab and act on a keypress
+  // See if the compositor should grab and act on a keypress
   if (keyboard->grabbed_keycode == 0) {
     uint32_t sym = xkb_state_key_get_one_sym(keyboard->wlr_keyboard->xkb_state, event->keycode + 8);
     uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
@@ -327,7 +326,7 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
     if (handle_switch_vt_key(keyboard->server, sym)) {
       return;
     }
-    if (modifiers & WLR_MODIFIER_LOGO == WLR_MODIFIER_LOGO) {
+    if ((modifiers & WLR_MODIFIER_LOGO) == WLR_MODIFIER_LOGO) {
       if (handle_quick_key(keyboard->server, sym)) {
         return;
       }
@@ -346,11 +345,6 @@ static void keyboard_handle_destroy(struct wl_listener *listener, void *data) {
    */
   struct tinywl_keyboard *keyboard =
       wl_container_of(listener, keyboard, destroy);
-
-  // free compose state
-  if (keyboard->compose_state) {
-    xkb_compose_state_unref(keyboard->compose_state);
-  }
 
   wl_list_remove(&keyboard->modifiers.link);
   wl_list_remove(&keyboard->key.link);
@@ -391,14 +385,6 @@ static void server_new_keyboard(struct tinywl_server *server,
   // Set typematic key repeat parameters
   wlr_keyboard_set_repeat_info(wlr_keyboard, 25, 600);
 
-  // Initialize the state machine tracker for multi-step character sequences
-  if (server->compose_table) {
-    keyboard->compose_state = xkb_compose_state_new(server->compose_table,
-                                                    XKB_COMPOSE_STATE_NO_FLAGS);
-  } else {
-    keyboard->compose_state = NULL; // Safety fallback
-  }
-
   // Hook up listeners
   keyboard->modifiers.notify = keyboard_handle_modifiers;
   wl_signal_add(&wlr_keyboard->events.modifiers, &keyboard->modifiers);
@@ -414,6 +400,8 @@ static void server_new_keyboard(struct tinywl_server *server,
   wl_list_insert(&server->keyboards, &keyboard->link);
 }
 
+// New pointer does not allocate memory or store any custom state,
+// so no need for a handle_pointer_destroy
 static void server_new_pointer(struct tinywl_server *server,
                                struct wlr_input_device *device) {
   wlr_cursor_attach_input_device(server->cursor, device);
