@@ -361,11 +361,10 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
   if (keyboard->wlr_keyboard->xkb_state == NULL) return;
   if (event->keycode == 0) return;
 
-  // 1. First, ensure the seat knows which hardware keyboard is active.
-  // This is vital so the IME grab reads the correct keymap context.
+  // Ensure the seat knows which hardware keyboard is active.
   wlr_seat_set_keyboard(keyboard->server->seat, keyboard->wlr_keyboard);
     
-  // 2. Fix variable scope: use keyboard->server instead of undefined 'server'
+  // Fix variable scope: use keyboard->server instead of undefined 'server'
   if (keyboard->server->active_input_method && 
       keyboard->server->active_input_method->keyboard_grab) {
       
@@ -376,33 +375,40 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
       return; // Stop processing: do not send to standard window clients!
   }
     
-  // Grab and release it if and only if the corresponding press was grabbed
+  bool grab = false;
+
+  // Handle a key release
   if (event->state == WL_KEYBOARD_KEY_STATE_RELEASED &&
       event->keycode == keyboard->grabbed_keycode) {
     keyboard->grabbed_keycode = 0;
-    return;
+    grab = true;
   }
 
   // See if the compositor should grab and act on a keypress 
-  if (keyboard->grabbed_keycode == 0) {
+  if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED &&
+      keyboard->grabbed_keycode == 0) {
     uint32_t sym = xkb_state_key_get_one_sym(keyboard->wlr_keyboard->xkb_state, event->keycode + 8);
     uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
     if (handle_media_key(sym)) {
-      return;
+      grab = true;
     } 
     if (handle_switch_vt_key(keyboard->server, sym)) {
-      return;
+      grab = true;
     }
     if ((modifiers & WLR_MODIFIER_LOGO) == WLR_MODIFIER_LOGO) {
       if (handle_quick_key(keyboard->server, sym)) {
-        return;
+        grab = true;
       }
+    }
+    if (grab) {
+      keyboard->grabbed_keycode = event->keycode;
     }
   }
 
-  // Otherwise, forward standard typing events to the client
-  wlr_seat_keyboard_notify_key(keyboard->server->seat, event->time_msec,
-                               event->keycode, event->state);
+  if (!grab) {
+    wlr_seat_keyboard_notify_key(keyboard->server->seat, event->time_msec,
+                                 event->keycode, event->state);
+  }
 }
 
 
