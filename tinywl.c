@@ -26,8 +26,7 @@
 #include <wlr/util/log.h>
 #include <xkbcommon/xkbcommon.h>
 
-// for compose and zwp_text_input_manaer_v3
-#include <xkbcommon/xkbcommon-compose.h>
+// for compose and zwp_text_input_manager_v3
 #include <wlr/types/wlr_text_input_v3.h>
 
 // For TTY switching
@@ -80,9 +79,8 @@ struct tinywl_server {
   struct wl_list outputs;
   struct wl_listener new_output;
 
-  // for the compose key
+  // for  wlr_text_input_manager_v3 *text_input_mgr;
   struct wlr_text_input_manager_v3 *text_input_mgr;
-  struct xkb_context *xkb_context;
 
   // for DnD
   struct wl_listener request_start_drag;
@@ -229,6 +227,47 @@ static void spawn(const char *cmd) {
   }
 }
 
+void toggle_caps_lock_programmatically(struct wlr_seat *seat) {
+    if (!seat) {
+        return;
+    }
+
+    // Automatically grab the active keyboard tracked by the seat
+    struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
+    if (!keyboard || !keyboard->xkb_state || !keyboard->keymap) {
+        return;
+    }
+
+    // Find the XKB index for Caps Lock
+    xkb_mod_index_t caps_idx = xkb_keymap_mod_get_index(keyboard->keymap, XKB_MOD_NAME_CAPS);
+    if (caps_idx == XKB_MOD_INVALID) {
+        return;
+    }
+
+    // Check if Caps Lock is currently active in the locked mask
+    bool is_caps_on = xkb_state_mod_index_is_active(keyboard->xkb_state, caps_idx, XKB_STATE_MODS_LOCKED);
+
+    // Extract current tracking states from xkb common
+    uint32_t depressed = xkb_state_serialize_mods(keyboard->xkb_state, XKB_STATE_MODS_DEPRESSED);
+    uint32_t latched = xkb_state_serialize_mods(keyboard->xkb_state, XKB_STATE_MODS_LATCHED);
+    uint32_t locked = xkb_state_serialize_mods(keyboard->xkb_state, XKB_STATE_MODS_LOCKED);
+    uint32_t group = xkb_state_serialize_layout(keyboard->xkb_state, XKB_STATE_LAYOUT_EFFECTIVE);
+
+    // Invert the Caps Lock bit safely 
+    if (is_caps_on) {
+        locked &= ~(1 << caps_idx); 
+    } else {
+        locked |= (1 << caps_idx);  
+    }
+
+    // Force updates to the hardware state translation arrays
+    xkb_state_update_mask(keyboard->xkb_state, depressed, latched, locked, 0, 0, group);
+
+    // Notify the seat so it reflects to all clients and input peripherals
+    wlr_seat_keyboard_notify_modifiers(seat, &keyboard->modifiers);
+}
+
+
 static bool handle_media_key(uint32_t sym) {
   switch (sym) {
     case XKB_KEY_XF86AudioMute:
@@ -273,8 +312,6 @@ static bool handle_switch_vt_key(struct tinywl_server *server, uint32_t sym) {
   return false;
 }
 
-
-
 // This function assumes LOGO is held down and a key is pressed
 static bool handle_quick_key(struct tinywl_server *server, uint32_t sym) {
   switch (sym) {
@@ -289,6 +326,9 @@ static bool handle_quick_key(struct tinywl_server *server, uint32_t sym) {
         struct tinywl_toplevel *next_toplevel = wl_container_of(server->toplevels.prev, next_toplevel, link);
         focus_toplevel(next_toplevel, next_toplevel->xdg_toplevel->base->surface);
       }
+      return true;
+    case XKB_KEY_y:
+      toggle_caps_lock_programmatically(server->seat);
       return true;
     default:
       break;
@@ -365,19 +405,29 @@ static void server_new_keyboard(struct tinywl_server *server,
   keyboard->wlr_keyboard = wlr_keyboard;
   // keyboard->grabbed_keycode = 0 is automatic because of calloc
 
-  // Prepare the XKB context and layout configuration rules
-  struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+  // For the compose key
   struct xkb_rule_names rules = {
-      .rules = NULL,
-      .model = NULL,
       .layout = "us",
-      .variant = NULL,
+      .variant = "",
       .options = "compose:ralt", // Right Alt as the compose key
   };
 
-  // Compile the keymap using our options rules and assign it to the hardware
+  struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+  if (!context) {
+    free(keyboard);
+    return;
+  }
+
   struct xkb_keymap *keymap =
       xkb_keymap_new_from_names(context, &rules, XKB_KEYMAP_COMPILE_NO_FLAGS);
+
+  if (!keymap) {
+    xkb_context_unref(context);
+    free(keyboard);
+    return;
+  }
+
+  // Pass the keymap to wlroots
   wlr_keyboard_set_keymap(wlr_keyboard, keymap);
 
   // Clean up temporary compilation memory
@@ -1042,19 +1092,11 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  // Initialize one shared XKB context for the whole server lifetime
-  server.xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-  if (server.xkb_context == NULL) {
-    wlr_log(WLR_ERROR, "Failed to create XKB context");
-    return 1;
-  }
-
   // Instantiate the data device manager for copy/paste and drag-and-drop
   struct wlr_data_device_manager *data_device_manager =
       wlr_data_device_manager_create(server.wl_display);
   if (data_device_manager == NULL) {
     wlr_log(WLR_ERROR, "Failed to create data device manager");
-    xkb_context_unref(server.xkb_context); // clean up before exiting
     return 1;
   }
 
@@ -1067,7 +1109,6 @@ int main(int argc, char *argv[]) {
    * see the handling of the request_set_selection event below.*/
   wlr_compositor_create(server.wl_display, 5, server.renderer);
   wlr_subcompositor_create(server.wl_display);
-  wlr_data_device_manager_create(server.wl_display);
 
   /* Creates an output layout, which a wlroots utility for working with an
    * arrangement of screens in a physical layout. */
