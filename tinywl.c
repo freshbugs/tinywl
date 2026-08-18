@@ -33,12 +33,6 @@
 #include <libinput.h>
 #include <wlr/backend/libinput.h>
 
-// for zwp_text_input_manager_v3
-#include <wlr/types/wlr_text_input_v3.h>
-
-// for zwp_input_method_manager_v2
-#include <wlr/types/wlr_input_method_v2.h>
-
 /* For brevity's sake, struct members are annotated where they are used. */
 enum tinywl_cursor_mode {
   TINYWL_CURSOR_PASSTHROUGH,
@@ -85,17 +79,6 @@ struct tinywl_server {
   // for DnD
   struct wl_listener request_start_drag;
   struct wl_listener start_drag;
-
-  // for zwp_text_input_manager_v3
-  struct wlr_text_input_manager_v3 *text_input_manager;
-
-  // for zwp_input_method_manager_v2
-  struct wlr_input_method_manager_v2 *input_method_manager;
-  struct wlr_input_method_v2 *active_input_method;
-  struct wl_listener input_method_new;
-  struct wl_listener input_method_commit;
-  struct wl_listener input_method_destroy;
-  struct wl_listener text_input_focus;
 };
 
 struct tinywl_output {
@@ -157,28 +140,6 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel,
     if (prev_toplevel != NULL) {
       wlr_xdg_toplevel_set_activated(prev_toplevel, false);
     }
-
-    // Clear virtual text input focus for the old surface, for zwp_text_input_manager_v3
-    if (server->text_input_manager != NULL) {
-      struct wlr_text_input_v3 *text_input;
-      wl_list_for_each(text_input, &server->text_input_manager->text_inputs, link) {
-        if (text_input->focused_surface == prev_surface) {
-          wlr_text_input_v3_send_leave(text_input);
-        }
-      }
-    }
-  }
-  struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
-  /* Move the toplevel to the front */
-  wlr_scene_node_raise_to_top(&toplevel->scene_tree->node);
-  wl_list_remove(&toplevel->link);
-  wl_list_insert(&server->toplevels, &toplevel->link);
-  /* Activate the new surface */
-  wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
-  // There are no "grabbed" keys anymore
-  struct tinywl_keyboard *kbd;
-  wl_list_for_each(kbd, &server->keyboards, link) {
-    kbd->grabbed_keycode = 0;
   }
 
   /*
@@ -186,25 +147,11 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel,
    * track of this and automatically send key events to the appropriate
    * clients without additional work on your part.
    */
+  struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
   if (keyboard != NULL) {
     wlr_seat_keyboard_notify_enter(seat, toplevel->xdg_toplevel->base->surface,
                                    keyboard->keycodes, keyboard->num_keycodes,
                                    &keyboard->modifiers);
-  }
-
-  // text input focus synchronization, for zwp_text_input_manager_v3
-  if (surface != NULL && server->text_input_manager != NULL) {
-    struct wlr_text_input_v3 *text_input;
-    wl_list_for_each(text_input, &server->text_input_manager->text_inputs, link) {
-    // Find the text input struct for the app holding active hardware focus
-      if (wl_resource_get_client(text_input->resource) ==
-          wl_resource_get_client(surface->resource)) {
-        // If it isn't already focused by the text manager, activate it!
-        if (text_input->focused_surface != surface) {
-          wlr_text_input_v3_send_enter(text_input, surface);
-        }
-      }
-    }
   }
 }
 
@@ -319,17 +266,6 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 
   // Ensure the seat knows which hardware keyboard is active.
   wlr_seat_set_keyboard(keyboard->server->seat, keyboard->wlr_keyboard);
-    
-  // Fix variable scope: use keyboard->server instead of undefined 'server'
-  if (keyboard->server->active_input_method && 
-      keyboard->server->active_input_method->keyboard_grab) {
-      
-      // Fcitx5 has actively grabbed the keyboard; route raw keys exclusively to it
-      wlr_input_method_keyboard_grab_v2_send_key(
-          keyboard->server->active_input_method->keyboard_grab,
-          event->time_msec, event->keycode, event->state);
-      return; // Stop processing: do not send to standard window clients!
-  }
     
   bool grab = false;
 
@@ -987,7 +923,6 @@ static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
   toplevel->destroy.notify = xdg_toplevel_destroy;
   wl_signal_add(&xdg_surface->events.destroy, &toplevel->destroy);
 
-  /* cotd */
   struct wlr_xdg_toplevel *xdg_toplevel = xdg_surface->toplevel;
   toplevel->request_move.notify = xdg_toplevel_request_move;
   wl_signal_add(&xdg_toplevel->events.request_move, &toplevel->request_move);
@@ -1025,62 +960,6 @@ static void server_handle_start_drag(struct wl_listener *listener, void *data) {
   // text, you would hook into the drag surface listeners here. For now, leaving
   // it empty lets the drag function perfectly in the background.
 }
-
-static void handle_input_method_commit(struct wl_listener *listener, void *data) {
-    struct tinywl_server *server = wl_container_of(listener, server, input_method_commit);
-    struct wlr_input_method_v2 *ime = data;
-    
-    // Find the application text input area that currently holds focus
-    struct wlr_text_input_v3 *text_input;
-    wl_list_for_each(text_input, &server->text_input_manager->text_inputs, link) {
-        if (text_input->focused_surface) {
-            // Forward whatever text Fcitx5 processed/composed straight to the app
-            // FIXED: .preedit.string -> .preedit.text
-            wlr_text_input_v3_send_preedit_string(text_input, ime->current.preedit.text,
-                ime->current.preedit.cursor_begin, ime->current.preedit.cursor_end);
-            
-            // FIXED: .commit_string -> .commit_text
-            wlr_text_input_v3_send_commit_string(text_input, ime->current.commit_text);
-            
-            wlr_text_input_v3_send_done(text_input);
-        }
-    }
-}
-
-static void handle_input_method_destroy(struct wl_listener *listener, void *data) {
-    struct tinywl_server *server = wl_container_of(listener, server, input_method_destroy);
-    server->active_input_method = NULL;
-    wl_list_remove(&server->input_method_commit.link);
-    wl_list_remove(&server->input_method_destroy.link);
-}
-
-static void handle_input_method_new(struct wl_listener *listener, void *data) {
-    struct tinywl_server *server = wl_container_of(listener, server, input_method_new);
-    struct wlr_input_method_v2 *ime = data;
-
-    // Store the active IME instance (Fcitx5)
-    server->active_input_method = ime;
-
-    // Listen for when Fcitx5 processes a character composition and "commits" it
-    server->input_method_commit.notify = handle_input_method_commit;
-    wl_signal_add(&ime->events.commit, &server->input_method_commit);
-
-    server->input_method_destroy.notify = handle_input_method_destroy;
-    wl_signal_add(&ime->events.destroy, &server->input_method_destroy);
-}
-
-static void handle_text_input_focus(struct wl_listener *listener, void *data) {
-    struct tinywl_server *server = wl_container_of(listener, server, text_input_focus);
-    struct wlr_text_input_v3 *text_input = data;
-
-    // If an application gets text focus and Fcitx5 is running, link them up
-    if (server->active_input_method && text_input->focused_surface) {
-        wlr_input_method_v2_send_activate(server->active_input_method);
-    } else if (server->active_input_method) {
-        wlr_input_method_v2_send_deactivate(server->active_input_method);
-    }
-}
-
 
 int main(int argc, char *argv[]) {
   wlr_log_init(WLR_DEBUG, NULL);
@@ -1127,20 +1006,6 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  // Instantiate the text input manager, for zwp_text_input_manager_v3
-  server.text_input_manager = wlr_text_input_manager_v3_create(server.wl_display);
-  if (server.text_input_manager == NULL) {
-    wlr_log(WLR_ERROR, "Failed to create text input manager v3");
-    return 1;
-  }
-
-  // Instantiate the Input Method Manager V2 (This populates the protocol for wayland-info)
-  server.input_method_manager = wlr_input_method_manager_v2_create(server.wl_display);
-  if (server.input_method_manager == NULL) {
-    wlr_log(WLR_ERROR, "Failed to create input method manager v2");
-    return 1;
-  }
-
   // Instantiate the data device manager for copy/paste and drag-and-drop
   struct wlr_data_device_manager *data_device_manager =
       wlr_data_device_manager_create(server.wl_display);
@@ -1148,15 +1013,6 @@ int main(int argc, char *argv[]) {
     wlr_log(WLR_ERROR, "Failed to create data device manager");
     return 1;
   }
-
-  server.input_method_new.notify = handle_input_method_new;
-  wl_signal_add(&server.input_method_manager->events.input_method, &server.input_method_new);
-
-  // Track when apps focus/unfocus text fields so we can tell Fcitx5
-  server.text_input_focus.notify = handle_text_input_focus;
-  // Note: Depending on your wlroots version, you might wire this to the seat's focus signal
-  // or use a text_input_manager event. For basic implementations, manual triggers on surface focus updates work best.
-
 
   /* This creates some hands-off wlroots interfaces. The compositor is
    * necessary for clients to allocate surfaces, the subcompositor allows to
