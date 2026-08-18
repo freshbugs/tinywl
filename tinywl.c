@@ -240,47 +240,6 @@ static void spawn(const char *cmd) {
   }
 }
 
-void toggle_caps_lock_programmatically(struct wlr_seat *seat) {
-    if (!seat) {
-        return;
-    }
-
-    // Automatically grab the active keyboard tracked by the seat
-    struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
-    if (!keyboard || !keyboard->xkb_state || !keyboard->keymap) {
-        return;
-    }
-
-    // Find the XKB index for Caps Lock
-    xkb_mod_index_t caps_idx = xkb_keymap_mod_get_index(keyboard->keymap, XKB_MOD_NAME_CAPS);
-    if (caps_idx == XKB_MOD_INVALID) {
-        return;
-    }
-
-    // Check if Caps Lock is currently active in the locked mask
-    bool is_caps_on = xkb_state_mod_index_is_active(keyboard->xkb_state, caps_idx, XKB_STATE_MODS_LOCKED);
-
-    // Extract current tracking states from xkb common
-    uint32_t depressed = xkb_state_serialize_mods(keyboard->xkb_state, XKB_STATE_MODS_DEPRESSED);
-    uint32_t latched = xkb_state_serialize_mods(keyboard->xkb_state, XKB_STATE_MODS_LATCHED);
-    uint32_t locked = xkb_state_serialize_mods(keyboard->xkb_state, XKB_STATE_MODS_LOCKED);
-    uint32_t group = xkb_state_serialize_layout(keyboard->xkb_state, XKB_STATE_LAYOUT_EFFECTIVE);
-
-    // Invert the Caps Lock bit safely 
-    if (is_caps_on) {
-        locked &= ~(1 << caps_idx); 
-    } else {
-        locked |= (1 << caps_idx);  
-    }
-
-    // Force updates to the hardware state translation arrays
-    xkb_state_update_mask(keyboard->xkb_state, depressed, latched, locked, 0, 0, group);
-
-    // Notify the seat so it reflects to all clients and input peripherals
-    wlr_seat_keyboard_notify_modifiers(seat, &keyboard->modifiers);
-}
-
-
 static bool handle_media_key(uint32_t sym) {
   switch (sym) {
     case XKB_KEY_XF86AudioMute:
@@ -340,9 +299,6 @@ static bool handle_quick_key(struct tinywl_server *server, uint32_t sym) {
         focus_toplevel(next_toplevel, next_toplevel->xdg_toplevel->base->surface);
       }
       return true;
-    case XKB_KEY_y:
-      toggle_caps_lock_programmatically(server->seat);
-      return true;
     default:
       break;
   }
@@ -391,11 +347,9 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
     uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
     if (handle_media_key(sym)) {
       grab = true;
-    } 
-    if (handle_switch_vt_key(keyboard->server, sym)) {
+    } else if (handle_switch_vt_key(keyboard->server, sym)) {
       grab = true;
-    }
-    if ((modifiers & WLR_MODIFIER_LOGO) == WLR_MODIFIER_LOGO) {
+    } else if ((modifiers & WLR_MODIFIER_LOGO) == WLR_MODIFIER_LOGO) {
       if (handle_quick_key(keyboard->server, sym)) {
         grab = true;
       }
