@@ -33,6 +33,12 @@
 #include <libinput.h>
 #include <wlr/backend/libinput.h>
 
+// For wlr-screencopy-unstable-v1 (screenshots)
+#include <wlr/types/wlr_screencopy_v1.h>
+
+// For zxdg_output_manager_v1
+#include <wlr/types/wlr_xdg_output_v1.h>
+
 /* For brevity's sake, struct members are annotated where they are used. */
 enum tinywl_cursor_mode {
   TINYWL_CURSOR_PASSTHROUGH,
@@ -253,9 +259,14 @@ static bool handle_quick_key(struct tinywl_server *server, uint32_t sym) {
       return true;
     case XKB_KEY_Tab:
       if (wl_list_length(&server->toplevels) > 1) {
-        struct tinywl_toplevel *next_toplevel = wl_container_of(server->toplevels.prev, next_toplevel, link);
-        focus_toplevel(next_toplevel, next_toplevel->xdg_toplevel->base->surface);
+        struct tinywl_toplevel *next_toplevel =
+            wl_container_of(server->toplevels.prev, next_toplevel, link);
+        focus_toplevel(next_toplevel,
+                       next_toplevel->xdg_toplevel->base->surface);
       }
+      return true;
+    case XKB_KEY_d:
+      spawn("wofi --status drun");
       return true;
     default:
       break;
@@ -1047,6 +1058,12 @@ int main(int argc, char *argv[]) {
   server.scene = wlr_scene_create();
   server.scene_layout =
       wlr_scene_attach_output_layout(server.scene, server.output_layout);
+
+  // For wlr-screencopy-unstable-v1
+  wlr_screencopy_manager_v1_create(server.wl_display);
+
+  // For zxdg_output_manager_v1
+  wlr_xdg_output_manager_v1_create(server.wl_display, server.output_layout);
 
   /* Set up xdg-shell version 3. The xdg-shell is a Wayland protocol which is
    * used for application windows. For more detail on shells, refer to
