@@ -51,9 +51,6 @@ struct tinywl_server {
   struct wlr_backend *backend;
   struct wlr_session *session; // added
   struct wlr_renderer *renderer;
-  struct wlr_allocator *allocator;
-  struct wlr_scene *scene;
-  struct wlr_scene_output_layout *scene_layout;
 
   struct wlr_xdg_shell *xdg_shell;
   struct wl_listener new_xdg_surface;
@@ -82,17 +79,23 @@ struct tinywl_server {
   struct wl_list outputs;
   struct wl_listener new_output;
 
+  struct wlr_allocator *allocator;
+  struct wlr_scene *scene;
+  struct wlr_scene_output_layout *scene_layout;
+
   // for DnD
   struct wlr_drag *current_drag;
   struct wlr_scene_tree *drag_icon_tree;
-  struct wl_listener request_start_drag;
-  struct wl_listener start_drag;
-  struct wl_listener destroy_drag;
   // If drag_just_ended then it was a tag tearing, and the window appears under the mouse
   // calloc makes it initialize to false, but it could get stuck at true
   // A bulletproof implementtaion might use wlroots events.dnotify
   bool drag_just_ended; // for tag tearing
+  struct wl_listener request_start_drag;
+  struct wl_listener start_drag;
+  struct wl_listener destroy_drag;
 };
+
+
 
 struct tinywl_output {
   struct wl_list link;
@@ -108,6 +111,12 @@ struct tinywl_toplevel {
   struct tinywl_server *server;
   struct wlr_xdg_toplevel *xdg_toplevel;
   struct wlr_scene_tree *scene_tree;
+
+  // for fullscreen and maximized
+  bool is_maximized;
+  bool is_fullscreen;
+  struct wlr_box saved_geometry;
+
   struct wl_listener map;
   struct wl_listener unmap;
   struct wl_listener destroy;
@@ -129,74 +138,6 @@ struct tinywl_keyboard {
   uint32_t grabbed_keycode;  // keypress that we did not tell the client
 };
 
-// Move keyboard and visual focus to a toplevel and a surface inside it
-static void focus_toplevel(struct tinywl_toplevel *toplevel,
-                           struct wlr_surface *surface) {
-  if (toplevel == NULL || surface == NULL) {
-    wlr_log(WLR_INFO, "no change of focus");
-    return;
-  }
-  struct wlr_surface *prev_surface =
-      toplevel->server->seat->keyboard_state.focused_surface;
-  if (prev_surface == surface) {
-    wlr_log(WLR_INFO, "don't re-focus an already focused surface.");
-    return;
-  }
-
-  struct tinywl_server *server = toplevel->server;
-  struct wlr_seat *seat = server->seat;
-
-  // Visual switch toplevel - could fail for popups
-  if (prev_surface) {
-    struct wlr_xdg_toplevel *prev_toplevel =
-        wlr_xdg_toplevel_try_from_wlr_surface(prev_surface);
-    if (prev_toplevel != NULL) {
-      wlr_xdg_toplevel_set_activated(prev_toplevel, false);
-    }
-  }
-  wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
-
-  // Raise new focus in the scene tree and in our toplevel list
-  wlr_scene_node_raise_to_top(&toplevel->scene_tree->node);
-  wl_list_remove(&toplevel->link);
-  wl_list_insert(&server->toplevels, &toplevel->link);
-
-  // Clear grabbed keys
-  struct tinywl_keyboard *kbd;
-  wl_list_for_each(kbd, &server->keyboards, link) {
-    kbd->grabbed_keycode = 0;
-  }
-
-  // Clear the keyboard focus and send it to the new focus
-  wlr_seat_keyboard_notify_clear_focus(seat);
-  struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
-  if (keyboard == NULL) {
-    wlr_log(WLR_ERROR, "keyboard is NULL");
-    return;
-  }
-  wlr_seat_keyboard_notify_enter(seat, surface,
-                                 keyboard->keycodes, keyboard->num_keycodes,
-                                 &keyboard->modifiers);
-}
-
-static void keyboard_handle_modifiers(struct wl_listener *listener,
-                                      void *data) {
-  /* This event is raised when a modifier key, such as shift or alt, is
-   * pressed. We simply communicate this to the client. */
-  struct tinywl_keyboard *keyboard =
-      wl_container_of(listener, keyboard, modifiers);
-  /*
-   * A seat can only have one keyboard, but this is a limitation of the
-   * Wayland protocol - not wlroots. We assign all connected keyboards to the
-   * same seat. You can swap out the underlying wlr_keyboard like this and
-   * wlr_seat handles this transparently.
-   */
-  wlr_seat_set_keyboard(keyboard->server->seat, keyboard->wlr_keyboard);
-  /* Send modifiers to the client. */
-  wlr_seat_keyboard_notify_modifiers(keyboard->server->seat,
-                                     &keyboard->wlr_keyboard->modifiers);
-}
-
 // spawn a shell process - useful for keybindings
 static void spawn(const char *cmd) {
   // A standard doule-fork trick makes systemd deal with cleanup.
@@ -209,264 +150,6 @@ static void spawn(const char *cmd) {
     }
     _exit(0);
   }
-}
-
-static bool handle_media_key(uint32_t sym) {
-  switch (sym) {
-    case XKB_KEY_XF86AudioMute:
-      spawn("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle");
-      return true;
-    case XKB_KEY_XF86AudioLowerVolume:
-      spawn("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-");
-      return true;
-    case XKB_KEY_XF86AudioRaiseVolume:
-      spawn("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+ -l 1.0");
-      return true;
-    case XKB_KEY_XF86AudioMicMute:
-      spawn("amixer set Capture toggle");
-      return true;
-    case XKB_KEY_XF86MonBrightnessDown:
-      spawn("brightnessctl set 1%-");
-      return true;
-    case XKB_KEY_XF86MonBrightnessUp:
-      spawn("brightnessctl set 1%+");
-      return true;
-    case XKB_KEY_XF86Favorites:
-      spawn("playerctl play-pause");
-      return true;
-    default:
-      return false; // Not a handled media key
-  }
-}
-
-// This function assumes a key was pressed
-// Ctrl+Alt+Fn is mapped to XKB_KEY_XF86Switch_VT_n, and switches virtual terminals
-static bool handle_switch_vt_key(struct tinywl_server *server, uint32_t sym) {
-  // VT_1 through VT_4 are perfectly contiguous
-  if (sym >= XKB_KEY_XF86Switch_VT_1 && sym <= XKB_KEY_XF86Switch_VT_4) {
-    uint32_t vt_number = 1 + (sym - XKB_KEY_XF86Switch_VT_1);
-
-    if (server->session != NULL) {
-      wlr_log(WLR_INFO, "Switching to TTY %d via server state", vt_number);
-      wlr_session_change_vt(server->session, vt_number);
-    }
-    return true; // Swallowed cleanly
-  }
-  return false;
-}
-
-// This function assumes LOGO is held down and a key is pressed
-static bool handle_quick_key(struct tinywl_server *server, uint32_t sym) {
-  switch (sym) {
-    case XKB_KEY_Return:
-      spawn("foot");
-      return true;
-    case XKB_KEY_Escape:
-      wl_display_terminate(server->wl_display);
-      return true;
-    case XKB_KEY_Tab:
-      if (wl_list_length(&server->toplevels) > 1) {
-        struct tinywl_toplevel *next_toplevel =
-            wl_container_of(server->toplevels.prev, next_toplevel, link);
-        focus_toplevel(next_toplevel,
-                       next_toplevel->xdg_toplevel->base->surface);
-      }
-      return true;
-    case XKB_KEY_d:
-      spawn("wofi --show drun");
-      return true;
-    default:
-      break;
-  }
-  return false;
-}
-
-static void keyboard_handle_key(struct wl_listener *listener, void *data) {
-  struct tinywl_keyboard *keyboard = wl_container_of(listener, keyboard, key);
-  struct wlr_keyboard_key_event *event = data;
-
-  // sanity check
-  if (keyboard == NULL || event == NULL) {
-    wlr_log(WLR_ERROR, "keyboard fail");
-    return;
-  }
-  if (event->keycode == 0) {
-    wlr_log(WLR_ERROR, "keycode 0");
-    return;
-  }
-
-  if (keyboard->server == NULL) return;
-  if (keyboard->wlr_keyboard == NULL) return;
-  if (keyboard->wlr_keyboard->xkb_state == NULL) return;
-
-  // Ensure the seat knows this hardware keyboard is active.
-  wlr_seat_set_keyboard(keyboard->server->seat, keyboard->wlr_keyboard);
-    
-  bool grab = false;
-
-  // Handle a key release
-  if (event->state == WL_KEYBOARD_KEY_STATE_RELEASED &&
-      event->keycode == keyboard->grabbed_keycode) {
-    keyboard->grabbed_keycode = 0;
-    grab = true;
-  }
-
-  // See if the compositor should grab and act on a keypress 
-  if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED &&
-      keyboard->grabbed_keycode == 0) {
-    uint32_t sym = xkb_state_key_get_one_sym(keyboard->wlr_keyboard->xkb_state, event->keycode + 8);
-    uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
-    if (handle_media_key(sym)) {
-      grab = true;
-    } else if (handle_switch_vt_key(keyboard->server, sym)) {
-      grab = true;
-    } else if ((modifiers & WLR_MODIFIER_LOGO) == WLR_MODIFIER_LOGO) {
-      if (handle_quick_key(keyboard->server, sym)) {
-        grab = true;
-      }
-    }
-    if (grab) {
-      keyboard->grabbed_keycode = event->keycode;
-    }
-  }
-
-  if (!grab) {
-    wlr_seat_keyboard_notify_key(keyboard->server->seat, event->time_msec,
-                                 event->keycode, event->state);
-  }
-}
-
-
-static void keyboard_handle_destroy(struct wl_listener *listener, void *data) {
-  /* This event is raised by the keyboard base wlr_input_device to signal
-   * the destruction of the wlr_keyboard. It will no longer receive events
-   * and should be destroyed.
-   */
-  struct tinywl_keyboard *keyboard =
-      wl_container_of(listener, keyboard, destroy);
-
-  wl_list_remove(&keyboard->modifiers.link);
-  wl_list_remove(&keyboard->key.link);
-  wl_list_remove(&keyboard->destroy.link);
-  wl_list_remove(&keyboard->link);
-  free(keyboard);
-}
-
-static void server_new_keyboard(struct tinywl_server *server,
-                                struct wlr_input_device *device) {
-  struct wlr_keyboard *wlr_keyboard = wlr_keyboard_from_input_device(device);
-
-  struct tinywl_keyboard *keyboard = calloc(1, sizeof(*keyboard));
-  if (!keyboard) {
-    return;
-  }
-  keyboard->server = server;
-  keyboard->wlr_keyboard = wlr_keyboard;
-
-  // Initialize XKB context and standard keymap
-  struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-  
-  struct xkb_rule_names rules = {
-    .options = "compose:ralt"
-  };
-
-  struct xkb_keymap *keymap =
-      xkb_keymap_new_from_names(context, &rules, XKB_KEYMAP_COMPILE_NO_FLAGS);
-  if (keymap) {
-    wlr_keyboard_set_keymap(wlr_keyboard, keymap);
-    xkb_keymap_unref(keymap);
-  }
-  xkb_context_unref(context);
-  
-  // Set typematic key repeat parameters
-  wlr_keyboard_set_repeat_info(wlr_keyboard, 25, 600);
-  
-  // Hook up listeners
-  keyboard->modifiers.notify = keyboard_handle_modifiers;
-  wl_signal_add(&wlr_keyboard->events.modifiers, &keyboard->modifiers);
-  keyboard->key.notify = keyboard_handle_key;
-  wl_signal_add(&wlr_keyboard->events.key, &keyboard->key);
-  keyboard->destroy.notify = keyboard_handle_destroy;
-  wl_signal_add(&device->events.destroy, &keyboard->destroy);
-
-  // Set this newly plugged-in device as the primary keyboard
-  wlr_seat_set_keyboard(server->seat, keyboard->wlr_keyboard);
-
-  // Inject our tracking instance into the server's tracking array
-  wl_list_insert(&server->keyboards, &keyboard->link);
-}
-
-// New pointer does not allocate memory or store any custom state,
-// so no need for a handle_pointer_destroy
-static void server_new_pointer(struct tinywl_server *server,
-                               struct wlr_input_device *device) {
-  wlr_cursor_attach_input_device(server->cursor, device);
-
-  /* Configure Tap-to-Click if this is a libinput device (like a touchpad) */
-  if (wlr_input_device_is_libinput(device)) {
-    struct libinput_device *libinput_dev =
-        wlr_libinput_get_device_handle(device);
-    if (libinput_device_config_tap_get_finger_count(libinput_dev) > 0) {
-      libinput_device_config_tap_set_enabled(libinput_dev,
-                                             LIBINPUT_CONFIG_TAP_ENABLED);
-    }
-  }
-}
-
-static void server_new_input(struct wl_listener *listener, void *data) {
-  /* This event is raised by the backend when a new input device becomes
-   * available. */
-  struct tinywl_server *server = wl_container_of(listener, server, new_input);
-  struct wlr_input_device *device = data;
-  switch (device->type) {
-  case WLR_INPUT_DEVICE_KEYBOARD:
-    server_new_keyboard(server, device);
-    break;
-  case WLR_INPUT_DEVICE_POINTER:
-    server_new_pointer(server, device);
-    break;
-  default:
-    break;
-  }
-  /* We need to let the wlr_seat know what our capabilities are, which is
-   * communiciated to the client. In TinyWL we always have a cursor, even if
-   * there are no pointer devices, so we always include that capability. */
-  uint32_t caps = WL_SEAT_CAPABILITY_POINTER;
-  if (!wl_list_empty(&server->keyboards)) {
-    caps |= WL_SEAT_CAPABILITY_KEYBOARD;
-  }
-  wlr_seat_set_capabilities(server->seat, caps);
-}
-
-static void seat_request_cursor(struct wl_listener *listener, void *data) {
-  struct tinywl_server *server =
-      wl_container_of(listener, server, request_cursor);
-  /* This event is raised by the seat when a client provides a cursor image */
-  struct wlr_seat_pointer_request_set_cursor_event *event = data;
-  struct wlr_seat_client *focused_client =
-      server->seat->pointer_state.focused_client;
-  /* This can be sent by any client, so we check to make sure this one is
-   * actually has pointer focus first. */
-  if (focused_client == event->seat_client) {
-    /* Once we've vetted the client, we can tell the cursor to use the
-     * provided surface as the cursor image. It will set the hardware cursor
-     * on the output that it's currently on and continue to do so as the
-     * cursor moves between outputs. */
-    wlr_cursor_set_surface(server->cursor, event->surface, event->hotspot_x,
-                           event->hotspot_y);
-  }
-}
-
-static void seat_request_set_selection(struct wl_listener *listener,
-                                       void *data) {
-  /* This event is raised by the seat when a client wants to set the selection,
-   * usually when the user copies something. wlroots allows compositors to
-   * ignore such requests if they so choose, but in tinywl we always honor
-   */
-  struct tinywl_server *server =
-      wl_container_of(listener, server, request_set_selection);
-  struct wlr_seat_request_set_selection_event *event = data;
-  wlr_seat_set_selection(server->seat, event->source, event->serial);
 }
 
 static struct tinywl_toplevel *desktop_toplevel_at(struct tinywl_server *server,
@@ -507,6 +190,17 @@ static void reset_cursor_mode(struct tinywl_server *server) {
 static void process_cursor_move(struct tinywl_server *server, uint32_t time) {
   /* Move the grabbed toplevel to the new position. */
   struct tinywl_toplevel *toplevel = server->grabbed_toplevel;
+
+  if (toplevel->is_fullscreen) {
+    return;
+  }
+
+  // If you're trying o move a maximized window, unmaximize it
+  if (toplevel->is_maximized) {
+    toplevel->is_maximized = false;
+    wlr_xdg_toplevel_set_maximized(toplevel->xdg_toplevel, false);
+  }
+
   wlr_scene_node_set_position(&toplevel->scene_tree->node,
                               server->cursor->x - server->grab_x,
                               server->cursor->y - server->grab_y);
@@ -524,6 +218,16 @@ static void process_cursor_resize(struct tinywl_server *server, uint32_t time) {
    * size, then commit any movement that was prepared.
    */
   struct tinywl_toplevel *toplevel = server->grabbed_toplevel;
+  if (toplevel->is_fullscreen) {
+    return;
+  }
+
+  // If you're trying to resize a maximized window, unmaximize it
+  if (toplevel->is_maximized) {
+    toplevel->is_maximized = false;
+    wlr_xdg_toplevel_set_maximized(toplevel->xdg_toplevel, false);
+  }
+
   double border_x = server->cursor->x - server->grab_x;
   double border_y = server->cursor->y - server->grab_y;
   int new_left = server->grab_geobox.x;
@@ -606,6 +310,52 @@ static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
     wlr_seat_pointer_clear_focus(seat);
   }
 }
+
+// Move keyboard and visual focus to a toplevel and a surface inside it
+static void focus_toplevel(struct tinywl_toplevel *toplevel,
+                           struct wlr_surface *surface) {
+  if (toplevel == NULL || surface == NULL) {
+    wlr_log(WLR_INFO, "no change of focus");
+    return;
+  }
+  struct wlr_surface *prev_surface =
+      toplevel->server->seat->keyboard_state.focused_surface;
+  if (prev_surface == surface) {
+    wlr_log(WLR_INFO, "don't re-focus an already focused surface.");
+    return;
+  }
+  struct tinywl_server *server = toplevel->server;
+  struct wlr_seat *seat = server->seat;
+  // Visual switch toplevel - could fail for popups
+  if (prev_surface) {
+    struct wlr_xdg_toplevel *prev_toplevel =
+        wlr_xdg_toplevel_try_from_wlr_surface(prev_surface);
+    if (prev_toplevel != NULL) {
+      wlr_xdg_toplevel_set_activated(prev_toplevel, false);
+    }
+  }
+  wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
+  // Raise new focus in the scene tree and in our toplevel list
+  wlr_scene_node_raise_to_top(&toplevel->scene_tree->node);
+  wl_list_remove(&toplevel->link);
+  wl_list_insert(&server->toplevels, &toplevel->link);
+  // Clear grabbed keys
+  struct tinywl_keyboard *kbd;
+  wl_list_for_each(kbd, &server->keyboards, link) {
+    kbd->grabbed_keycode = 0;
+  }
+  // Clear the keyboard focus and send it to the new focus
+  wlr_seat_keyboard_notify_clear_focus(seat);
+  struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
+  if (keyboard == NULL) {
+    wlr_log(WLR_ERROR, "keyboard is NULL");
+    return;
+  }
+  wlr_seat_keyboard_notify_enter(seat, surface,
+                                 keyboard->keycodes, keyboard->num_keycodes,
+                                 &keyboard->modifiers);
+}
+
 
 // For DnD
 static void update_drag_icon_position(struct tinywl_server *server) {
@@ -909,25 +659,95 @@ static void xdg_toplevel_request_resize(struct wl_listener *listener,
   begin_interactive(toplevel, TINYWL_CURSOR_RESIZE, event->edges);
 }
 
-static void xdg_toplevel_request_maximize(struct wl_listener *listener,
-                                          void *data) {
-  /* This event is raised when a client would like to maximize itself,
-   * typically because the user clicked on the maximize button on
-   * client-side decorations. tinywl doesn't support maximization, but
-   * to conform to xdg-shell protocol we still must send a configure.
-   * wlr_xdg_surface_schedule_configure() is used to send an empty reply. */
-  struct tinywl_toplevel *toplevel =
-      wl_container_of(listener, toplevel, request_maximize);
-  wlr_xdg_surface_schedule_configure(toplevel->xdg_toplevel->base);
+static void xdg_toplevel_request_fullscreen(struct wl_listener *listener, void *data) {
+// Possible issue:
+// wlr_scene_tree_node and xdg_toplevel->base->current.geometry both store the geometry
+// and they might be out of sync
+  struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel,
+                                                     request_fullscreen);
+  if (wl_list_empty(&toplevel->server->outputs)) {
+    return;
+  }
+  struct wlr_xdg_toplevel *xdg_toplevel = toplevel->xdg_toplevel;
+  bool requested = xdg_toplevel->requested.fullscreen;
+  if (requested == toplevel->is_fullscreen) {
+    return; 
+  }
+  toplevel->is_fullscreen = requested;
+  if (requested) {
+    // --- ENTERING FULLSCREEN ---
+    toplevel->saved_geometry.x = toplevel->scene_tree->node.x;
+    toplevel->saved_geometry.y = toplevel->scene_tree->node.y;
+    toplevel->saved_geometry.width = xdg_toplevel->base->current.geometry.width;
+    toplevel->saved_geometry.height = xdg_toplevel->base->current.geometry.height;
+    // Safely grab the first output container using tinywl's internal struct layout
+    struct tinywl_output *output = wl_container_of(toplevel->server->outputs.next, output, link);
+    struct wlr_output_layout *layout = toplevel->server->output_layout;
+    struct wlr_box output_box;
+    wlr_output_layout_get_box(layout, output->wlr_output, &output_box);
+
+    // Configure client state first to minimize visual layout thrashing
+    wlr_xdg_toplevel_set_size(xdg_toplevel, output_box.width, output_box.height);
+    wlr_xdg_toplevel_set_fullscreen(xdg_toplevel, true);
+
+    // Snap the scene tree node to the monitor coordinates
+    wlr_scene_node_set_position(&toplevel->scene_tree->node, output_box.x, output_box.y);
+  } else {
+    // --- EXITING FULLSCREEN ---
+    wlr_xdg_toplevel_set_size(xdg_toplevel, 
+                              toplevel->saved_geometry.width,
+                              toplevel->saved_geometry.height);
+    wlr_xdg_toplevel_set_fullscreen(xdg_toplevel, false);
+    wlr_scene_node_set_position(&toplevel->scene_tree->node, 
+                                toplevel->saved_geometry.x,
+                                toplevel->saved_geometry.y);
+
+  }
 }
 
-static void xdg_toplevel_request_fullscreen(struct wl_listener *listener,
-                                            void *data) {
-  /* Just as with request_maximize, we must send a configure here. */
-  struct tinywl_toplevel *toplevel =
-      wl_container_of(listener, toplevel, request_fullscreen);
-  wlr_xdg_surface_schedule_configure(toplevel->xdg_toplevel->base);
+// At time of writing, there are no status bars.
+// Maximized windows behave just like regular windows, but large and with a boolean flag.
+static void xdg_toplevel_request_maximize(struct wl_listener *listener, void *data) {
+  struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, request_maximize);
+  
+  if (wl_list_empty(&toplevel->server->outputs)) {
+    return;
+  }
+
+  struct wlr_xdg_toplevel *xdg_toplevel = toplevel->xdg_toplevel;
+  bool requested = xdg_toplevel->requested.maximized;
+
+  if (requested == toplevel->is_maximized) {
+    return;
+  }
+
+  toplevel->is_maximized = requested;
+
+  if (requested) {
+    // --- ENTERING MAXIMIZE ---
+    // Grab the first monitor output layout box
+    struct tinywl_output *output = wl_container_of(toplevel->server->outputs.next, output, link);
+    struct wlr_output_layout *layout = toplevel->server->output_layout;
+    struct wlr_box output_box;
+    wlr_output_layout_get_box(layout, output->wlr_output, &output_box);
+
+    // Tell the client to buffer at full screen scale
+    wlr_xdg_toplevel_set_size(xdg_toplevel, output_box.width, output_box.height);
+    wlr_xdg_toplevel_set_maximized(xdg_toplevel, true);
+
+    // Snap the scene tree node to the monitor coordinates
+    wlr_scene_node_set_position(&toplevel->scene_tree->node, output_box.x, output_box.y);
+  } else {
+    // --- EXITING MAXIMIZE ---
+    // Drop back to a standard floating dimension footprint
+    wlr_xdg_toplevel_set_size(xdg_toplevel, 800, 600);
+    wlr_xdg_toplevel_set_maximized(xdg_toplevel, false);
+
+    // Position it somewhere safe, like top-left or centered
+    wlr_scene_node_set_position(&toplevel->scene_tree->node, 100, 100);
+  }
 }
+
 
 static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
   /* This event is raised when wlr_xdg_shell receives a new xdg surface from a
@@ -1048,6 +868,297 @@ static void server_handle_start_drag(struct wl_listener *listener, void *data) {
     
     // Instantly position the icon under the mouse right now
     update_drag_icon_position(server);
+}
+
+static void keyboard_handle_modifiers(struct wl_listener *listener,
+                                      void *data) {
+  /* This event is raised when a modifier key, such as shift or alt, is
+   * pressed. We simply communicate this to the client. */
+  struct tinywl_keyboard *keyboard =
+      wl_container_of(listener, keyboard, modifiers);
+  /*
+   * A seat can only have one keyboard, but this is a limitation of the
+   * Wayland protocol - not wlroots. We assign all connected keyboards to the
+   * same seat. You can swap out the underlying wlr_keyboard like this and
+   * wlr_seat handles this transparently.
+   */
+  wlr_seat_set_keyboard(keyboard->server->seat, keyboard->wlr_keyboard);
+  /* Send modifiers to the client. */
+  wlr_seat_keyboard_notify_modifiers(keyboard->server->seat,
+                                     &keyboard->wlr_keyboard->modifiers);
+}
+
+static bool handle_media_key(uint32_t sym) {
+  switch (sym) {
+    case XKB_KEY_XF86AudioMute:
+      spawn("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle");
+      return true;
+    case XKB_KEY_XF86AudioLowerVolume:
+      spawn("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-");
+      return true;
+    case XKB_KEY_XF86AudioRaiseVolume:
+      spawn("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+ -l 1.0");
+      return true;
+    case XKB_KEY_XF86AudioMicMute:
+      spawn("amixer set Capture toggle");
+      return true;
+    case XKB_KEY_XF86MonBrightnessDown:
+      spawn("brightnessctl set 1%-");
+      return true;
+    case XKB_KEY_XF86MonBrightnessUp:
+      spawn("brightnessctl set 1%+");
+      return true;
+    case XKB_KEY_XF86Favorites:
+      spawn("playerctl play-pause");
+      return true;
+    default:
+      return false; // Not a handled media key
+  }
+}
+
+// This function assumes a key was pressed
+// Ctrl+Alt+Fn is mapped to XKB_KEY_XF86Switch_VT_n, and switches virtual terminals
+static bool handle_switch_vt_key(struct tinywl_server *server, uint32_t sym) {
+  // VT_1 through VT_4 are perfectly contiguous
+  if (sym >= XKB_KEY_XF86Switch_VT_1 && sym <= XKB_KEY_XF86Switch_VT_4) {
+    uint32_t vt_number = 1 + (sym - XKB_KEY_XF86Switch_VT_1);
+
+    if (server->session != NULL) {
+      wlr_log(WLR_INFO, "Switching to TTY %d via server state", vt_number);
+      wlr_session_change_vt(server->session, vt_number);
+    }
+    return true; // Swallowed cleanly
+  }
+  return false;
+}
+
+// This function assumes LOGO is held down and a key is pressed
+static bool handle_quick_key(struct tinywl_server *server, uint32_t sym) {
+  switch (sym) {
+    case XKB_KEY_Return:
+      spawn("foot");
+      return true;
+    case XKB_KEY_Escape:
+      wl_display_terminate(server->wl_display);
+      return true;
+    case XKB_KEY_Tab:
+      if (wl_list_length(&server->toplevels) > 1) {
+        struct tinywl_toplevel *next_toplevel =
+            wl_container_of(server->toplevels.prev, next_toplevel, link);
+        focus_toplevel(next_toplevel,
+                       next_toplevel->xdg_toplevel->base->surface);
+      }
+      return true;
+    case XKB_KEY_d:
+      spawn("wofi --show drun");
+      return true;
+    case XKB_KEY_f:
+      // Toggle fullscreen state for the currently focused window
+      struct wlr_seat *seat = server->seat;
+      struct wlr_surface *focused_surface = seat->keyboard_state.focused_surface;
+      if (!focused_surface) break;
+      struct wlr_xdg_surface *xdg_surface = wlr_xdg_surface_try_from_wlr_surface(focused_surface);
+      if (xdg_surface && xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL && xdg_surface->data) {
+        struct wlr_scene_tree *tree = xdg_surface->data;
+        struct tinywl_toplevel *toplevel = tree->node.data;
+        if (toplevel) {
+          bool will_fullscreen = !toplevel->is_fullscreen;
+          toplevel->xdg_toplevel->requested.fullscreen = will_fullscreen;
+          xdg_toplevel_request_fullscreen(&toplevel->request_fullscreen, NULL);
+        }
+      }
+      return true;
+    default:
+      break;
+  }
+  return false;
+}
+
+static void keyboard_handle_key(struct wl_listener *listener, void *data) {
+  struct tinywl_keyboard *keyboard = wl_container_of(listener, keyboard, key);
+  struct wlr_keyboard_key_event *event = data;
+
+  // sanity check
+  if (keyboard == NULL || event == NULL) {
+    wlr_log(WLR_ERROR, "keyboard fail");
+    return;
+  }
+  if (event->keycode == 0) {
+    wlr_log(WLR_ERROR, "keycode 0");
+    return;
+  }
+
+  if (keyboard->server == NULL) return;
+  if (keyboard->wlr_keyboard == NULL) return;
+  if (keyboard->wlr_keyboard->xkb_state == NULL) return;
+
+  // Ensure the seat knows this hardware keyboard is active.
+  wlr_seat_set_keyboard(keyboard->server->seat, keyboard->wlr_keyboard);
+    
+  bool grab = false;
+
+  // Handle a key release
+  if (event->state == WL_KEYBOARD_KEY_STATE_RELEASED &&
+      event->keycode == keyboard->grabbed_keycode) {
+    keyboard->grabbed_keycode = 0;
+    grab = true;
+  }
+
+  // See if the compositor should grab and act on a keypress 
+  if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED &&
+      keyboard->grabbed_keycode == 0) {
+    uint32_t sym = xkb_state_key_get_one_sym(keyboard->wlr_keyboard->xkb_state, event->keycode + 8);
+    uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
+    if (handle_media_key(sym)) {
+      grab = true;
+    } else if (handle_switch_vt_key(keyboard->server, sym)) {
+      grab = true;
+    } else if ((modifiers & WLR_MODIFIER_LOGO) == WLR_MODIFIER_LOGO) {
+      if (handle_quick_key(keyboard->server, sym)) {
+        grab = true;
+      }
+    }
+    if (grab) {
+      keyboard->grabbed_keycode = event->keycode;
+    }
+  }
+
+  if (!grab) {
+    wlr_seat_keyboard_notify_key(keyboard->server->seat, event->time_msec,
+                                 event->keycode, event->state);
+  }
+}
+
+static void keyboard_handle_destroy(struct wl_listener *listener, void *data) {
+  /* This event is raised by the keyboard base wlr_input_device to signal
+   * the destruction of the wlr_keyboard. It will no longer receive events
+   * and should be destroyed.
+   */
+  struct tinywl_keyboard *keyboard =
+      wl_container_of(listener, keyboard, destroy);
+
+  wl_list_remove(&keyboard->modifiers.link);
+  wl_list_remove(&keyboard->key.link);
+  wl_list_remove(&keyboard->destroy.link);
+  wl_list_remove(&keyboard->link);
+  free(keyboard);
+}
+
+static void server_new_keyboard(struct tinywl_server *server,
+                                struct wlr_input_device *device) {
+  struct wlr_keyboard *wlr_keyboard = wlr_keyboard_from_input_device(device);
+
+  struct tinywl_keyboard *keyboard = calloc(1, sizeof(*keyboard));
+  if (!keyboard) {
+    return;
+  }
+  keyboard->server = server;
+  keyboard->wlr_keyboard = wlr_keyboard;
+
+  // Initialize XKB context and standard keymap
+  struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+  
+  struct xkb_rule_names rules = {
+    .options = "compose:ralt"
+  };
+
+  struct xkb_keymap *keymap =
+      xkb_keymap_new_from_names(context, &rules, XKB_KEYMAP_COMPILE_NO_FLAGS);
+  if (keymap) {
+    wlr_keyboard_set_keymap(wlr_keyboard, keymap);
+    xkb_keymap_unref(keymap);
+  }
+  xkb_context_unref(context);
+  
+  // Set typematic key repeat parameters
+  wlr_keyboard_set_repeat_info(wlr_keyboard, 25, 600);
+  
+  // Hook up listeners
+  keyboard->modifiers.notify = keyboard_handle_modifiers;
+  wl_signal_add(&wlr_keyboard->events.modifiers, &keyboard->modifiers);
+  keyboard->key.notify = keyboard_handle_key;
+  wl_signal_add(&wlr_keyboard->events.key, &keyboard->key);
+  keyboard->destroy.notify = keyboard_handle_destroy;
+  wl_signal_add(&device->events.destroy, &keyboard->destroy);
+
+  // Set this newly plugged-in device as the primary keyboard
+  wlr_seat_set_keyboard(server->seat, keyboard->wlr_keyboard);
+
+  // Inject our tracking instance into the server's tracking array
+  wl_list_insert(&server->keyboards, &keyboard->link);
+}
+
+// New pointer does not allocate memory or store any custom state,
+// so no need for a handle_pointer_destroy
+static void server_new_pointer(struct tinywl_server *server,
+                               struct wlr_input_device *device) {
+  wlr_cursor_attach_input_device(server->cursor, device);
+
+  /* Configure Tap-to-Click if this is a libinput device (like a touchpad) */
+  if (wlr_input_device_is_libinput(device)) {
+    struct libinput_device *libinput_dev =
+        wlr_libinput_get_device_handle(device);
+    if (libinput_device_config_tap_get_finger_count(libinput_dev) > 0) {
+      libinput_device_config_tap_set_enabled(libinput_dev,
+                                             LIBINPUT_CONFIG_TAP_ENABLED);
+    }
+  }
+}
+
+static void seat_request_cursor(struct wl_listener *listener, void *data) {
+  struct tinywl_server *server =
+      wl_container_of(listener, server, request_cursor);
+  /* This event is raised by the seat when a client provides a cursor image */
+  struct wlr_seat_pointer_request_set_cursor_event *event = data;
+  struct wlr_seat_client *focused_client =
+      server->seat->pointer_state.focused_client;
+  /* This can be sent by any client, so we check to make sure this one is
+   * actually has pointer focus first. */
+  if (focused_client == event->seat_client) {
+    /* Once we've vetted the client, we can tell the cursor to use the
+     * provided surface as the cursor image. It will set the hardware cursor
+     * on the output that it's currently on and continue to do so as the
+     * cursor moves between outputs. */
+    wlr_cursor_set_surface(server->cursor, event->surface, event->hotspot_x,
+                           event->hotspot_y);
+  }
+}
+
+static void seat_request_set_selection(struct wl_listener *listener,
+                                       void *data) {
+  /* This event is raised by the seat when a client wants to set the selection,
+   * usually when the user copies something. wlroots allows compositors to
+   * ignore such requests if they so choose, but in tinywl we always honor
+   */
+  struct tinywl_server *server =
+      wl_container_of(listener, server, request_set_selection);
+  struct wlr_seat_request_set_selection_event *event = data;
+  wlr_seat_set_selection(server->seat, event->source, event->serial);
+}
+
+static void server_new_input(struct wl_listener *listener, void *data) {
+  /* This event is raised by the backend when a new input device becomes
+   * available. */
+  struct tinywl_server *server = wl_container_of(listener, server, new_input);
+  struct wlr_input_device *device = data;
+  switch (device->type) {
+  case WLR_INPUT_DEVICE_KEYBOARD:
+    server_new_keyboard(server, device);
+    break;
+  case WLR_INPUT_DEVICE_POINTER:
+    server_new_pointer(server, device);
+    break;
+  default:
+    break;
+  }
+  /* We need to let the wlr_seat know what our capabilities are, which is
+   * communiciated to the client. In TinyWL we always have a cursor, even if
+   * there are no pointer devices, so we always include that capability. */
+  uint32_t caps = WL_SEAT_CAPABILITY_POINTER;
+  if (!wl_list_empty(&server->keyboards)) {
+    caps |= WL_SEAT_CAPABILITY_KEYBOARD;
+  }
+  wlr_seat_set_capabilities(server->seat, caps);
 }
 
 
