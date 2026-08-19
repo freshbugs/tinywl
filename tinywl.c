@@ -83,8 +83,15 @@ struct tinywl_server {
   struct wl_listener new_output;
 
   // for DnD
+  struct wlr_drag *current_drag;
+  struct wlr_scene_tree *drag_icon_tree;
   struct wl_listener request_start_drag;
   struct wl_listener start_drag;
+  struct wl_listener destroy_drag;
+  // If drag_just_ended then it was a tag tearing, and the window appears under the mouse
+  // calloc makes it initialize to false, but it could get stuck at true
+  // A bulletproof implementtaion might use wlroots events.dnotify
+  bool drag_just_ended; // for tag tearing
 };
 
 struct tinywl_output {
@@ -266,7 +273,7 @@ static bool handle_quick_key(struct tinywl_server *server, uint32_t sym) {
       }
       return true;
     case XKB_KEY_d:
-      spawn("wofi --status drun");
+      spawn("wofi --show drun");
       return true;
     default:
       break;
@@ -600,6 +607,29 @@ static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
   }
 }
 
+// For DnD
+static void update_drag_icon_position(struct tinywl_server *server) {
+  if (!server->current_drag || !server->drag_icon_tree) {
+    return;
+  }
+
+  // Explicitly cast coordinates to clean integers (matching pixels)
+  int x = (int)server->cursor->x;
+  int y = (int)server->cursor->y;
+
+  struct wlr_scene_node *node = &server->drag_icon_tree->node;
+
+  // Direct performance optimization: 
+  // If the drag icon tree node is already exactly at this layout coordinate,
+  // do absolutely nothing! This halts the swapchain allocation spam.
+  if (node->x == x && node->y == y) {
+    return;
+  }
+
+  // Only update and re-render if the cursor actually jumped to a new pixel
+  wlr_scene_node_set_position(node, x, y);
+}
+
 static void server_cursor_motion(struct wl_listener *listener, void *data) {
   /* This event is forwarded by the cursor when a pointer emits a _relative_
    * pointer motion event (i.e. a delta) */
@@ -614,6 +644,7 @@ static void server_cursor_motion(struct wl_listener *listener, void *data) {
   wlr_cursor_move(server->cursor, &event->pointer->base, event->delta_x,
                   event->delta_y);
   process_cursor_motion(server, event->time_msec);
+  update_drag_icon_position(server); // for DnD
 }
 
 static void server_cursor_motion_absolute(struct wl_listener *listener,
@@ -922,6 +953,7 @@ static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
 
   /* Allocate a tinywl_toplevel for this surface */
   struct tinywl_toplevel *toplevel = calloc(1, sizeof(*toplevel));
+
   toplevel->server = server;
   toplevel->xdg_toplevel = xdg_surface->toplevel;
 
@@ -929,6 +961,14 @@ static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
       &toplevel->server->scene->tree, toplevel->xdg_toplevel->base);
   toplevel->scene_tree->node.data = toplevel;
   xdg_surface->data = toplevel->scene_tree;
+
+  // For DnD, to make tab tearing nice
+  if (server->drag_just_ended) {
+    server->drag_just_ended = false;
+    int spawn_x = (int)server->cursor->x;
+    int spawn_y = (int)server->cursor->y;
+    wlr_scene_node_set_position(&toplevel->scene_tree->node, spawn_x, spawn_y);
+  }
 
   /* Listen to the various events it can emit */
   toplevel->map.notify = xdg_toplevel_map;
@@ -969,12 +1009,47 @@ static void server_handle_request_start_drag(struct wl_listener *listener,
   }
 }
 
-static void server_handle_start_drag(struct wl_listener *listener, void *data) {
-  // struct wlr_drag *drag = data;
-  // Optional: If you want to render the floating preview icon of the dragged
-  // text, you would hook into the drag surface listeners here. For now, leaving
-  // it empty lets the drag function perfectly in the background.
+// For DnD
+static void handle_destroy_drag(struct wl_listener *listener, void *data) {
+    struct tinywl_server *server = wl_container_of(listener, server, destroy_drag);
+
+    // Completely destroy the scene tree (removes it from screen graphics)
+    if (server->drag_icon_tree) {
+        wlr_scene_node_destroy(&server->drag_icon_tree->node);
+        server->drag_icon_tree = NULL;
+    }
+
+    server->drag_just_ended = true; // for tag tearing
+
+    server->current_drag = NULL;
+    wl_list_remove(&server->destroy_drag.link);
 }
+
+// For DnD
+static void server_handle_start_drag(struct wl_listener *listener, void *data) {
+    struct tinywl_server *server = wl_container_of(listener, server, start_drag);
+    struct wlr_drag *drag = data;
+
+    server->current_drag = drag;
+
+    server->drag_just_ended = false; // for tag tearing
+
+    // Create a new scene node tree for the drag icon attached to the root scene
+    server->drag_icon_tree = wlr_scene_tree_create(&server->scene->tree);
+
+    if (drag->icon) {
+        // Automatically link the drag icon's surface to our scene tree
+        wlr_scene_drag_icon_create(server->drag_icon_tree, drag->icon);
+    }
+
+    // Set up the destroy listener to clean it all up when done
+    server->destroy_drag.notify = handle_destroy_drag;
+    wl_signal_add(&drag->events.destroy, &server->destroy_drag);
+    
+    // Instantly position the icon under the mouse right now
+    update_drag_icon_position(server);
+}
+
 
 int main(int argc, char *argv[]) {
   wlr_log_init(WLR_DEBUG, NULL);
@@ -1002,14 +1077,14 @@ int main(int argc, char *argv[]) {
   // Choose the most suitable backend based on the current environment
   server.backend = wlr_backend_autocreate(server.wl_display, &server.session);
   if (server.backend == NULL) {
-    wlr_log(WLR_ERROR, "failed to create wlr_backend");
+    wlr_log(WLR_ERROR, "Failed to create wlr_backend");
     return 1;
   }
 
   // Create a renderer
   server.renderer = wlr_renderer_autocreate(server.backend);
   if (server.renderer == NULL) {
-    wlr_log(WLR_ERROR, "failed to create wlr_renderer");
+    wlr_log(WLR_ERROR, "Failed to create wlr_renderer");
     return 1;
   }
   wlr_renderer_init_wl_display(server.renderer, server.wl_display);
@@ -1017,11 +1092,11 @@ int main(int argc, char *argv[]) {
   // Create an allocator - the bridge between renderer and backend
   server.allocator = wlr_allocator_autocreate(server.backend, server.renderer);
   if (server.allocator == NULL) {
-    wlr_log(WLR_ERROR, "failed to create wlr_allocator");
+    wlr_log(WLR_ERROR, "Failed to create wlr_allocator");
     return 1;
   }
 
-  // Instantiate the data device manager for copy/paste and drag-and-drop
+  // Instantiate the data device manager for copy/paste and DnD
   struct wlr_data_device_manager *data_device_manager =
       wlr_data_device_manager_create(server.wl_display);
   if (data_device_manager == NULL) {
@@ -1121,7 +1196,9 @@ int main(int argc, char *argv[]) {
   wl_signal_add(&server.backend->events.new_input, &server.new_input);
   server.seat = wlr_seat_create(server.wl_display, "seat0");
 
-  // Register drag-and-drop listeners
+  // For DnD
+  server.start_drag.notify = server_handle_start_drag;
+  wl_signal_add(&server.seat->events.start_drag, &server.start_drag);
   server.request_start_drag.notify = server_handle_request_start_drag;
   wl_signal_add(&server.seat->events.request_start_drag,
                 &server.request_start_drag);
