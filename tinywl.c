@@ -120,30 +120,30 @@ struct tinywl_keyboard {
 static void focus_toplevel(struct tinywl_toplevel *toplevel,
                            struct wlr_surface *surface) {
   if (toplevel == NULL || surface == NULL) {
+    wlr_log(WLR_INFO, "no change of focus");
     return;
   }
-  
+  struct wlr_surface *prev_surface =
+      toplevel->server->seat->keyboard_state.focused_surface;
+  if (prev_surface == surface) {
+    wlr_log(WLR_INFO, "don't re-focus an already focused surface.");
+    return;
+  }
+
   struct tinywl_server *server = toplevel->server;
   struct wlr_seat *seat = server->seat;
-  struct wlr_surface *prev_surface = seat->keyboard_state.focused_surface;
-  
-  if (prev_surface == surface) {
-    /* Don't re-focus an already focused surface. */
-    return;
-  }
-  
-  // Deactivate the old surface's toplevel if it exists
+
+  // Visual switch toplevel - could fail for popups
   if (prev_surface) {
     struct wlr_xdg_toplevel *prev_toplevel =
         wlr_xdg_toplevel_try_from_wlr_surface(prev_surface);
     if (prev_toplevel != NULL) {
       wlr_xdg_toplevel_set_activated(prev_toplevel, false);
     }
-    // Note: xdg_toplevel_try... will return NULL from a popup, resulting in a visual glitch
-    // Ideally, climb the protocol tree to find the toplevel
   }
+  wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
 
-  // Raise it in the scene tree and in our toplevel list
+  // Raise new focus in the scene tree and in our toplevel list
   wlr_scene_node_raise_to_top(&toplevel->scene_tree->node);
   wl_list_remove(&toplevel->link);
   wl_list_insert(&server->toplevels, &toplevel->link);
@@ -154,18 +154,17 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel,
     kbd->grabbed_keycode = 0;
   }
 
-  // Activate the new toplevel window visually
-  wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
-
-  // Send keyboard enter to the exact surface requested
+  // Clear the keyboard focus and send it to the new focus
+  wlr_seat_keyboard_notify_clear_focus(seat);
   struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
-  if (keyboard != NULL) {
-    wlr_seat_keyboard_notify_enter(seat, surface,
-                                   keyboard->keycodes, keyboard->num_keycodes,
-                                   &keyboard->modifiers);
+  if (keyboard == NULL) {
+    wlr_log(WLR_ERROR, "keyboard is NULL");
+    return;
   }
+  wlr_seat_keyboard_notify_enter(seat, surface,
+                                 keyboard->keycodes, keyboard->num_keycodes,
+                                 &keyboard->modifiers);
 }
-
 
 static void keyboard_handle_modifiers(struct wl_listener *listener,
                                       void *data) {
@@ -264,19 +263,25 @@ static bool handle_quick_key(struct tinywl_server *server, uint32_t sym) {
   return false;
 }
 
-
 static void keyboard_handle_key(struct wl_listener *listener, void *data) {
   struct tinywl_keyboard *keyboard = wl_container_of(listener, keyboard, key);
   struct wlr_keyboard_key_event *event = data;
 
   // sanity check
-  if (keyboard == NULL) return;
+  if (keyboard == NULL || event == NULL) {
+    wlr_log(WLR_ERROR, "keyboard fail");
+    return;
+  }
+  if (event->keycode == 0) {
+    wlr_log(WLR_ERROR, "keycode 0");
+    return;
+  }
+
   if (keyboard->server == NULL) return;
   if (keyboard->wlr_keyboard == NULL) return;
   if (keyboard->wlr_keyboard->xkb_state == NULL) return;
-  if (event->keycode == 0) return;
 
-  // Ensure the seat knows which hardware keyboard is active.
+  // Ensure the seat knows this hardware keyboard is active.
   wlr_seat_set_keyboard(keyboard->server->seat, keyboard->wlr_keyboard);
     
   bool grab = false;
@@ -339,6 +344,16 @@ static void server_new_keyboard(struct tinywl_server *server,
   }
   keyboard->server = server;
   keyboard->wlr_keyboard = wlr_keyboard;
+
+  // Create a default XKB context and keymap
+  struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+  struct xkb_keymap *keymap = xkb_keymap_new_from_names(context, NULL,
+                                                XKB_KEYMAP_COMPILE_NO_FLAGS);
+  if (keymap) {
+    wlr_keyboard_set_keymap(wlr_keyboard, keymap);
+    xkb_keymap_unref(keymap);
+  }
+  xkb_context_unref(context);
   
   // Set typematic key repeat parameters
   wlr_keyboard_set_repeat_info(wlr_keyboard, 25, 600);
