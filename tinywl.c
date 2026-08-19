@@ -345,10 +345,15 @@ static void server_new_keyboard(struct tinywl_server *server,
   keyboard->server = server;
   keyboard->wlr_keyboard = wlr_keyboard;
 
-  // Create a default XKB context and keymap
+  // Initialize XKB context and standard keymap
   struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-  struct xkb_keymap *keymap = xkb_keymap_new_from_names(context, NULL,
-                                                XKB_KEYMAP_COMPILE_NO_FLAGS);
+  
+  struct xkb_rule_names rules = {
+    .options = "compose:ralt"
+  };
+
+  struct xkb_keymap *keymap =
+      xkb_keymap_new_from_names(context, &rules, XKB_KEYMAP_COMPILE_NO_FLAGS);
   if (keymap) {
     wlr_keyboard_set_keymap(wlr_keyboard, keymap);
     xkb_keymap_unref(keymap);
