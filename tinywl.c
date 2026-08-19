@@ -333,44 +333,16 @@ static void server_new_keyboard(struct tinywl_server *server,
                                 struct wlr_input_device *device) {
   struct wlr_keyboard *wlr_keyboard = wlr_keyboard_from_input_device(device);
 
-  // Allocate and initialize the tracking structure
   struct tinywl_keyboard *keyboard = calloc(1, sizeof(*keyboard));
+  if (!keyboard) {
+    return;
+  }
   keyboard->server = server;
   keyboard->wlr_keyboard = wlr_keyboard;
-  // keyboard->grabbed_keycode = 0 is automatic because of calloc
-
-  // For the compose key
-  struct xkb_rule_names rules = {
-      .layout = "us",
-      .variant = "",
-      .options = "compose:ralt", // Right Alt as the compose key
-  };
-
-  struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-  if (!context) {
-    free(keyboard);
-    return;
-  }
-
-  struct xkb_keymap *keymap =
-      xkb_keymap_new_from_names(context, &rules, XKB_KEYMAP_COMPILE_NO_FLAGS);
-
-  if (!keymap) {
-    xkb_context_unref(context);
-    free(keyboard);
-    return;
-  }
-
-  // Pass the keymap to wlroots
-  wlr_keyboard_set_keymap(wlr_keyboard, keymap);
-
-  // Clean up temporary compilation memory
-  xkb_keymap_unref(keymap);
-  xkb_context_unref(context);
-
+  
   // Set typematic key repeat parameters
   wlr_keyboard_set_repeat_info(wlr_keyboard, 25, 600);
-
+  
   // Hook up listeners
   keyboard->modifiers.notify = keyboard_handle_modifiers;
   wl_signal_add(&wlr_keyboard->events.modifiers, &keyboard->modifiers);
