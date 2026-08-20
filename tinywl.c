@@ -614,6 +614,14 @@ static void server_new_output(struct wl_listener *listener, void *data) {
       wlr_output_layout_add_auto(server->output_layout, wlr_output);
   struct wlr_scene_output *scene_output =
       wlr_scene_output_create(server->scene, wlr_output);
+
+  // Background color
+  float background_color[4] = {0.25f, 0.05f, 0.05f, 1.0f};
+  wlr_scene_rect_create(&server->scene->tree, 
+                        wlr_output->width, 
+                        wlr_output->height, 
+                        background_color);
+
   wlr_scene_output_layout_add_output(server->scene_layout, l_output,
                                      scene_output);
 }
