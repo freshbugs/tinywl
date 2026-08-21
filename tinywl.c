@@ -149,6 +149,20 @@ struct tinywl_keyboard {
   uint32_t grabbed_keycode;
 };
 
+// Struct for baby popup windows that have not yet been configured
+struct tinywl_unconfigured {
+  struct wlr_xdg_surface *xdg_surface;
+  struct tinywl_server *server;
+  struct wl_listener commit;
+  struct wl_listener destroy;
+};
+
+// Struct to manage the popup's lifecycle
+struct tinywl_popup {
+    struct wlr_xdg_surface *xdg_surface;
+    struct wl_listener destroy;
+};
+
 // spawn a shell process
 static void spawn(const char *cmd) {
   // A standard doule-fork trick makes systemd deal with cleanup.
@@ -634,6 +648,16 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 // Function called when the surface is mapped, ready for display.
 static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
   struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, map);
+  struct tinywl_server *server = toplevel->server;
+
+  // Intercept placement due to a finished drag, added for DnD and tearoff tabs
+  if (server->drag_just_ended) {
+    server->drag_just_ended = false;
+    int spawn_x = (int)server->cursor->x;
+    int spawn_y = (int)server->cursor->y;
+    wlr_scene_node_set_position(&toplevel->scene_tree->node, spawn_x, spawn_y);
+  }
+
   wl_list_insert(&toplevel->server->toplevels, &toplevel->link);
   focus_toplevel(toplevel, toplevel->xdg_toplevel->base->surface);
 }
@@ -828,7 +852,6 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
   if (!toplevel->is_resizing) {
     return;
   }
-
   struct wlr_xdg_surface *xdg_surface = toplevel->xdg_toplevel->base;
   if (xdg_surface->current.geometry.width == toplevel->pending_width &&
       xdg_surface->current.geometry.height == toplevel->pending_height) {
@@ -839,68 +862,138 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
   }
 }
 
-// Event raised when client sends a new xdg surface to wlr_xdg_shell
-static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
-  struct tinywl_server *server =
-      wl_container_of(listener, server, new_xdg_surface);
-  struct wlr_xdg_surface *xdg_surface = data;
-
-  // Provide the proper parent scene node to an xdg popup.
-  // To do this, set the user data field of xdg_surfaces.
-  if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_POPUP) {
-    struct wlr_xdg_surface *parent =
-        wlr_xdg_surface_try_from_wlr_surface(xdg_surface->popup->parent);
-    assert(parent != NULL);
-    struct wlr_scene_tree *parent_tree = parent->data;
-    xdg_surface->data = wlr_scene_xdg_surface_create(parent_tree, xdg_surface);
-    return;
-  }
-  assert(xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL);
-
-  /* Allocate a tinywl_toplevel for this surface */
+static void handle_new_toplevel(struct tinywl_server *server,
+                                struct wlr_xdg_surface *xdg_surface) {
   struct tinywl_toplevel *toplevel = calloc(1, sizeof(*toplevel));
-
   toplevel->server = server;
   toplevel->xdg_toplevel = xdg_surface->toplevel;
 
-  toplevel->scene_tree = wlr_scene_xdg_surface_create(
-      &toplevel->server->scene->tree, toplevel->xdg_toplevel->base);
+  // Attach to the scene graph
+  toplevel->scene_tree = wlr_scene_xdg_surface_create(&server->scene->tree,
+                                                       xdg_surface);
   toplevel->scene_tree->node.data = toplevel;
   xdg_surface->data = toplevel->scene_tree;
 
-  // For DnD, to make tab tearing nice
-  if (server->drag_just_ended) {
-    server->drag_just_ended = false;
-    int spawn_x = (int)server->cursor->x;
-    int spawn_y = (int)server->cursor->y;
-    wlr_scene_node_set_position(&toplevel->scene_tree->node, spawn_x, spawn_y);
-  }
-
-  /* Listen to the various events it can emit */
+  // Set up listeners
+  // Core Surface Layer Events (map, unmap, commit)
   toplevel->map.notify = xdg_toplevel_map;
   wl_signal_add(&xdg_surface->surface->events.map, &toplevel->map);
+
   toplevel->unmap.notify = xdg_toplevel_unmap;
   wl_signal_add(&xdg_surface->surface->events.unmap, &toplevel->unmap);
-  toplevel->destroy.notify = xdg_toplevel_destroy;
-  wl_signal_add(&xdg_surface->events.destroy, &toplevel->destroy);
-  // added commit handler
+
   toplevel->commit.notify = xdg_toplevel_commit;
   wl_signal_add(&xdg_surface->surface->events.commit, &toplevel->commit);
 
-  struct wlr_xdg_toplevel *xdg_toplevel = xdg_surface->toplevel;
-  toplevel->request_move.notify = xdg_toplevel_request_move;
-  wl_signal_add(&xdg_toplevel->events.request_move, &toplevel->request_move);
-  toplevel->request_resize.notify = xdg_toplevel_request_resize;
-  wl_signal_add(&xdg_toplevel->events.request_resize,
-                &toplevel->request_resize);
-  toplevel->request_maximize.notify = xdg_toplevel_request_maximize;
-  wl_signal_add(&xdg_toplevel->events.request_maximize,
-                &toplevel->request_maximize);
-  toplevel->request_fullscreen.notify = xdg_toplevel_request_fullscreen;
-  wl_signal_add(&xdg_toplevel->events.request_fullscreen,
-                &toplevel->request_fullscreen);
+  // Shell Management Layer Event (destroy)
+  toplevel->destroy.notify = xdg_toplevel_destroy;
+  wl_signal_add(&xdg_surface->events.destroy, &toplevel->destroy);
 
-  wl_list_insert(&server->toplevels, &toplevel->link);
+  // Window Type Interaction Events (move, resize, maximize, fullscreen)
+  toplevel->request_move.notify = xdg_toplevel_request_move;
+  wl_signal_add(&xdg_surface->toplevel->events.request_move, &toplevel->request_move);
+
+  toplevel->request_resize.notify = xdg_toplevel_request_resize;
+  wl_signal_add(&xdg_surface->toplevel->events.request_resize, &toplevel->request_resize);
+
+  toplevel->request_maximize.notify = xdg_toplevel_request_maximize;
+  wl_signal_add(&xdg_surface->toplevel->events.request_maximize, &toplevel->request_maximize);
+
+  toplevel->request_fullscreen.notify = xdg_toplevel_request_fullscreen;
+  wl_signal_add(&xdg_surface->toplevel->events.request_fullscreen, &toplevel->request_fullscreen);
+}
+
+static void handle_popup_destroy(struct wl_listener *listener, void *data) {
+    struct tinywl_popup *popup = wl_container_of(listener, popup, destroy);
+    wl_list_remove(&popup->destroy.link);
+    free(popup);
+}
+
+static void handle_new_popup(struct tinywl_server *server,
+                             struct wlr_xdg_surface *xdg_surface) {
+  // Find the parent surface's scene tree node
+  struct wlr_xdg_surface *parent = 
+    wlr_xdg_surface_try_from_wlr_surface(xdg_surface->popup->parent);
+
+  if (parent == NULL || parent->data == NULL) {
+    wlr_log(WLR_DEBUG, "Popup parent is missing a scene node.");
+    return;
+  }
+  struct wlr_scene_tree *parent_tree = parent->data;
+
+  // Allocate a tracking structure for this popup's lifecycle
+  struct tinywl_popup *popup = calloc(1, sizeof(*popup));
+  popup->xdg_surface = xdg_surface;
+
+  // Create the scene node and save it to xdg_surface->data
+  struct wlr_scene_tree *popup_tree = wlr_scene_xdg_surface_create(parent_tree,
+                                                                   xdg_surface);
+  xdg_surface->data = popup_tree;
+
+  // Setup the destroy listener
+  popup->destroy.notify = handle_popup_destroy;
+  wl_signal_add(&xdg_surface->events.destroy, &popup->destroy);
+}
+
+// Handle windows that have not yet been configured
+static void handle_unconfigured_commit(struct wl_listener *listener, void *data) {
+  struct tinywl_unconfigured *unconfigured = wl_container_of(listener, unconfigured, commit);
+  struct wlr_xdg_surface *xdg_surface = unconfigured->xdg_surface;
+
+  if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_NONE) {
+    return; // Keep waiting
+  }
+
+  wl_list_remove(&unconfigured->commit.link);
+  wl_list_remove(&unconfigured->destroy.link);
+
+  if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
+    handle_new_toplevel(unconfigured->server, xdg_surface);
+  } else if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_POPUP) {
+    handle_new_popup(unconfigured->server, xdg_surface);
+  }
+
+  free(unconfigured);
+}
+
+// If a window gets destroyed before it was configured and committed
+static void handle_unconfigured_destroy(struct wl_listener *listener, void *data) {
+    struct tinywl_unconfigured *unconfigured = wl_container_of(listener, unconfigured, destroy);
+    wl_list_remove(&unconfigured->commit.link);
+    wl_list_remove(&unconfigured->destroy.link);
+    free(unconfigured);
+}
+
+// Handle a new unconfigured window - give it a listener until it is configured
+static void handle_new_unconfigured_surface(struct tinywl_server *server,
+                                            struct wlr_xdg_surface *xdg_surface) {
+    struct tinywl_unconfigured *unconfigured = calloc(1, sizeof(*unconfigured));
+    unconfigured->xdg_surface = xdg_surface;
+    unconfigured->server = server;
+
+    unconfigured->commit.notify = handle_unconfigured_commit;
+    wl_signal_add(&xdg_surface->surface->events.commit, &unconfigured->commit);
+
+    unconfigured->destroy.notify = handle_unconfigured_destroy;
+    wl_signal_add(&xdg_surface->events.destroy, &unconfigured->destroy);
+}
+
+// Event raised when client sends a new xdg surface to wlr_xdg_shell
+static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
+  struct tinywl_server *server = wl_container_of(listener, server, new_xdg_surface);
+  struct wlr_xdg_surface *xdg_surface = data;
+
+  switch (xdg_surface->role) {
+    case WLR_XDG_SURFACE_ROLE_NONE:
+      handle_new_unconfigured_surface(server, xdg_surface);
+      break;
+    case WLR_XDG_SURFACE_ROLE_POPUP:
+      handle_new_popup(server, xdg_surface);
+      break;
+    case WLR_XDG_SURFACE_ROLE_TOPLEVEL:
+      handle_new_toplevel(server, xdg_surface);
+      break;
+  }
 }
 
 static void server_handle_request_start_drag(struct wl_listener *listener,
