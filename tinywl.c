@@ -42,6 +42,12 @@
 // For zxdg_output_manager_v1
 #include <wlr/types/wlr_xdg_output_v1.h>
 
+// For xdg-activation-v1
+#include <wlr/types/wlr_xdg_activation_v1.h>
+
+// For wlr_idle_notifier_v1
+#include <wlr/types/wlr_idle_notify_v1.h>
+
 /* For brevity's sake, struct members are annotated where they are used. */
 enum tinywl_cursor_mode {
   TINYWL_CURSOR_PASSTHROUGH,
@@ -93,6 +99,15 @@ struct tinywl_server {
   struct wl_listener request_start_drag;
   struct wl_listener start_drag;
   struct wl_listener destroy_drag;
+
+  // For xdg-activation-v1.xml
+  struct wlr_xdg_activation_v1 *xdg_activation;
+  struct wl_listener request_activation;
+
+  // For wlr_idle_notifier_v1
+  struct wlr_idle_notifier_v1 *idle_notifier;
+  struct wl_listener idle_away;
+  struct wl_listener idle_resume;
 };
 
 struct tinywl_output {
@@ -176,6 +191,40 @@ static void spawn(const char *cmd) {
     _exit(0);
   }
 }
+
+// For wlr_idle_notifier_v1
+static void handle_idle_away(struct wl_listener *listener, void *data) {
+    struct tinywl_server *server = wl_container_of(listener, server, idle_away);
+    
+    // Loop through all connected monitors/outputs and turn them off
+    struct tinywl_output *output;
+    wl_list_for_each(output, &server->outputs, link) {
+        struct wlr_output_state state;
+        wlr_output_state_init(&state);
+        wlr_output_state_set_enabled(&state, false); // Disable display output
+        wlr_output_commit_state(output->wlr_output, &state);
+        wlr_output_state_finish(&state);
+    }
+}
+
+// For wlr_idle_notifier_v1
+static void handle_idle_resume(struct wl_listener *listener, void *data) {
+    struct tinywl_server *server = wl_container_of(listener, server, idle_resume);
+    
+    // The user moved the mouse! Turn all monitors back on
+    struct tinywl_output *output;
+    wl_list_for_each(output, &server->outputs, link) {
+        struct wlr_output_state state;
+        wlr_output_state_init(&state);
+        wlr_output_state_set_enabled(&state, true); // Re-enable display output
+        wlr_output_commit_state(output->wlr_output, &state);
+        wlr_output_state_finish(&state);
+        
+        // Schedule a frame redraw immediately so the screen isn't blank
+        wlr_output_schedule_frame(output->wlr_output);
+    }
+}
+
 
 // Return the topmost node in the scene at given pixel.
 // Look for a scene node and climb the tree to one with node-data.
@@ -369,10 +418,18 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel,
   unfocus_toplevel(server);
 
   // Activate and raise the new toplevel
-  wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
-  wlr_scene_node_raise_to_top(&toplevel->scene_tree->node);
+  if (toplevel->xdg_toplevel && toplevel->scene_tree) {
+    wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
+    wlr_scene_node_raise_to_top(&toplevel->scene_tree->node);
+  }
+  
+  // Re-insert into the server's focused/active list
   wl_list_remove(&toplevel->link);
   wl_list_insert(&server->toplevels, &toplevel->link);
+
+  // Inform the seat of the keyboard focus change
+  wlr_seat_keyboard_notify_enter(seat, toplevel->xdg_toplevel->base->surface,
+                                 NULL, 0, NULL);
 
   // Clear grabbed keys
   struct tinywl_keyboard *kbd;
@@ -380,11 +437,14 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel,
     kbd->grabbed_keycode = 0;
   }
 
+  // Focus the specific active surface (supports popups/subsurfaces)
   struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
   if (keyboard != NULL) {
     wlr_seat_keyboard_notify_enter(seat, surface,
                                    keyboard->keycodes, keyboard->num_keycodes,
                                    &keyboard->modifiers);
+  } else {
+    wlr_seat_keyboard_notify_enter(seat, surface, NULL, 0, NULL);
   }
 }
 
@@ -420,6 +480,7 @@ static void server_cursor_motion(struct wl_listener *listener, void *data) {
                   event->delta_x, event->delta_y);
   process_cursor_motion(server, event->time_msec);
   update_drag_icon_position(server); // for DnD
+  wlr_idle_notifier_v1_notify_activity(server->idle_notifier, server->seat);
 }
 
 // This function is triggered by an absolute pointer motion event
@@ -432,6 +493,7 @@ static void server_cursor_motion_absolute(struct wl_listener *listener,
   wlr_cursor_warp_absolute(server->cursor, &event->pointer->base,
                            event->x, event->y);
   process_cursor_motion(server, event->time_msec);
+  wlr_idle_notifier_v1_notify_activity(server->idle_notifier, server->seat);
 }
 
 // Set up an interactive move/resize, where the compositor grabs mouse events
@@ -996,6 +1058,31 @@ static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
   }
 }
 
+// For xdg-activation-v1.xml - when you click on a link to open a browser
+static void server_request_activation(struct wl_listener *listener, void *data) {
+  struct tinywl_server *server = 
+      wl_container_of(listener, server, request_activation);
+  struct wlr_xdg_activation_v1_request_activate_event *event = data;
+
+  // Verify the surface exists and is an XDG surface
+  if (!event->surface || !wlr_xdg_surface_try_from_wlr_surface(event->surface)) {
+    return;
+  }
+
+  struct wlr_xdg_surface *xdg_surface = 
+      wlr_xdg_surface_try_from_wlr_surface(event->surface);
+
+  if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL && xdg_surface->data) {
+    struct wlr_scene_tree *scene_tree = xdg_surface->data;
+    struct tinywl_toplevel *toplevel = scene_tree->node.data;
+  
+    if (toplevel) {
+      // Focus the window that the link is trying to open
+      focus_toplevel(toplevel, event->surface); 
+    }
+  }
+}
+
 static void server_handle_request_start_drag(struct wl_listener *listener,
                                              void *data) {
   struct wlr_seat_request_start_drag_event *event = data;
@@ -1187,12 +1274,16 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
     return;
   }
 
-  if (keyboard->server == NULL) return;
+  struct tinywl_server *server = keyboard->server;
+
+  if (server == NULL) return;
   if (keyboard->wlr_keyboard == NULL) return;
   if (keyboard->wlr_keyboard->xkb_state == NULL) return;
 
+  wlr_idle_notifier_v1_notify_activity(server->idle_notifier, server->seat);
+
   // Ensure the seat knows this hardware keyboard is active.
-  wlr_seat_set_keyboard(keyboard->server->seat, keyboard->wlr_keyboard);
+  wlr_seat_set_keyboard(server->seat, keyboard->wlr_keyboard);
     
   bool grab = false;
 
@@ -1210,10 +1301,10 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
     uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
     if (handle_media_key(sym)) {
       grab = true;
-    } else if (handle_switch_vt_key(keyboard->server, sym)) {
+    } else if (handle_switch_vt_key(server, sym)) {
       grab = true;
     } else if ((modifiers & WLR_MODIFIER_LOGO) == WLR_MODIFIER_LOGO) {
-      if (handle_quick_key(keyboard->server, sym)) {
+      if (handle_quick_key(server, sym)) {
         grab = true;
       }
     }
@@ -1223,7 +1314,7 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
   }
 
   if (!grab) {
-    wlr_seat_keyboard_notify_key(keyboard->server->seat, event->time_msec,
+    wlr_seat_keyboard_notify_key(server->seat, event->time_msec,
                                  event->keycode, event->state);
   }
 }
@@ -1495,6 +1586,10 @@ int main(int argc, char *argv[]) {
   server.cursor_frame.notify = server_cursor_frame;
   wl_signal_add(&server.cursor->events.frame, &server.cursor_frame);
 
+
+  // For wlr_idle_notifier_v1
+  server.idle_notifier = wlr_idle_notifier_v1_create(server.wl_display);
+
   /*
    * Configures a seat, which is a single "seat" at which a user sits and
    * operates the computer. This conceptually includes up to one keyboard,
@@ -1521,6 +1616,13 @@ int main(int argc, char *argv[]) {
   server.request_set_selection.notify = seat_request_set_selection;
   wl_signal_add(&server.seat->events.request_set_selection,
                 &server.request_set_selection);
+
+
+  // For xdg-activation-v1.xml
+  server.xdg_activation = wlr_xdg_activation_v1_create(server.wl_display);
+  server.request_activation.notify = server_request_activation;
+  wl_signal_add(&server.xdg_activation->events.request_activate, 
+                &server.request_activation);
 
   /* Add a Unix socket to the Wayland display. */
   const char *socket = wl_display_add_socket_auto(server.wl_display);
