@@ -319,23 +319,12 @@ static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
   }
 }
 
-// Move keyboard and visual focus to a toplevel and a surface inside it
-static void focus_toplevel(struct tinywl_toplevel *toplevel,
-                           struct wlr_surface *surface) {
-  if (toplevel == NULL || surface == NULL) {
-    wlr_log(WLR_INFO, "no change of focus");
-    return;
-  }
-  struct wlr_surface *prev_surface =
-      toplevel->server->seat->keyboard_state.focused_surface;
-  if (prev_surface == surface) {
-    wlr_log(WLR_INFO, "don't re-focus an already focused surface.");
-    return;
-  }
-  struct tinywl_server *server = toplevel->server;
+// Unfocus
+static void unfocus_toplevel(struct tinywl_server *server) {
   struct wlr_seat *seat = server->seat;
+  struct wlr_surface *prev_surface = seat->keyboard_state.focused_surface;
 
-  // Visual switch toplevel - could fail for popups
+  // Visually deactivate the old window if one was focused
   if (prev_surface) {
     struct wlr_xdg_toplevel *prev_toplevel =
         wlr_xdg_toplevel_try_from_wlr_surface(prev_surface);
@@ -343,9 +332,30 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel,
       wlr_xdg_toplevel_set_activated(prev_toplevel, false);
     }
   }
-  wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
 
-  // Raise new focus in the scene tree and in our toplevel list
+  // Cleanly notify the seat and underlying wlroots architecture
+  wlr_seat_keyboard_notify_clear_focus(seat);
+  wlr_log(WLR_DEBUG, "Compositor focus completely cleared.");
+}
+
+static void focus_toplevel(struct tinywl_toplevel *toplevel,
+                           struct wlr_surface *surface) {
+  if (toplevel == NULL) {
+    wlr_log(WLR_ERROR, "Trying to focus NULL");
+    return;
+  }
+  struct tinywl_server *server = toplevel->server;
+  struct wlr_seat *seat = server->seat;
+  struct wlr_surface *prev_surface = seat->keyboard_state.focused_surface;
+
+  if (prev_surface == surface) {
+    return; // Already focused
+  }
+
+  unfocus_toplevel(server);
+
+  // Activate and raise the new toplevel
+  wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
   wlr_scene_node_raise_to_top(&toplevel->scene_tree->node);
   wl_list_remove(&toplevel->link);
   wl_list_insert(&server->toplevels, &toplevel->link);
@@ -356,17 +366,12 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel,
     kbd->grabbed_keycode = 0;
   }
 
-  // Clear the keyboard focus and send it to the new focus
-  wlr_seat_keyboard_notify_clear_focus(seat);
   struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
-  if (keyboard == NULL) {
-    wlr_log(WLR_ERROR, "keyboard is NULL");
-    return;
+  if (keyboard != NULL) {
+    wlr_seat_keyboard_notify_enter(seat, surface,
+                                   keyboard->keycodes, keyboard->num_keycodes,
+                                   &keyboard->modifiers);
   }
-
-  wlr_seat_keyboard_notify_enter(seat, surface,
-                                 keyboard->keycodes, keyboard->num_keycodes,
-                                 &keyboard->modifiers);
 }
 
 // For DnD
@@ -479,7 +484,7 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 
   // Clicking empty space
   if (!toplevel) {
-    wlr_seat_keyboard_clear_focus(server->seat);
+    unfocus_toplevel(server);
     wlr_seat_pointer_notify_button(server->seat, event->time_msec,
                                    event->button, event->state);
     return;
@@ -633,13 +638,37 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
   focus_toplevel(toplevel, toplevel->xdg_toplevel->base->surface);
 }
 
-// Function called when the surface is unmapped.
+// Function called when the surface is unmapped (visually hidden/closed).
 static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
   struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, unmap);
-  if (toplevel == toplevel->server->grabbed_toplevel) {
-    reset_cursor_mode(toplevel->server);
+  struct tinywl_server *server = toplevel->server;
+
+  // Clear cursor grab if this window was being manipulated
+  if (toplevel == server->grabbed_toplevel) {
+    reset_cursor_mode(server);
   }
+
+  // Check if this unmapping window currently has keyboard focus
+  struct wlr_surface *focused_surface = server->seat->keyboard_state.focused_surface;
+  bool was_focused = false;
+  if (focused_surface) {
+    was_focused = (toplevel->xdg_toplevel->base->surface ==
+                  wlr_surface_get_root_surface(focused_surface));
+  }
+
+  // Remove it from the compositor's window list
   wl_list_remove(&toplevel->link);
+
+  // Evacuate focus safely BEFORE the window data structures are destroyed
+  if (was_focused) {
+    if (wl_list_empty(&server->toplevels)) {
+      unfocus_toplevel(server);
+    } else {
+      struct tinywl_toplevel *next_toplevel = wl_container_of(
+          server->toplevels.next, next_toplevel, link);
+      focus_toplevel(next_toplevel, next_toplevel->xdg_toplevel->base->surface);
+    }
+  }
 }
 
 // Function called when the xdg_toplevel is destroyed.
@@ -647,7 +676,15 @@ static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
   struct tinywl_toplevel *toplevel =
       wl_container_of(listener, toplevel, destroy);
 
-  // Check if the window being destroyed is the one with keyboard focus
+  // If this view was being moved or resized, reset the cursor mode.
+  struct tinywl_server *server = toplevel->server;
+  if (server->cursor_mode != TINYWL_CURSOR_PASSTHROUGH &&
+      server->grabbed_toplevel == toplevel) {
+    server->cursor_mode = TINYWL_CURSOR_PASSTHROUGH;
+    server->grabbed_toplevel = NULL;
+  }
+
+  // Check if the window being destroyed is the one with keyboard focus.
   struct wlr_surface *focused_surface =
       toplevel->server->seat->keyboard_state.focused_surface;
   bool was_focused = false;
@@ -670,7 +707,7 @@ static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
   // If the closed window was focused, find a replacement!
   if (was_focused) {
     if (wl_list_empty(&toplevel->server->toplevels)) {
-      wlr_seat_keyboard_clear_focus(toplevel->server->seat);
+      focus_toplevel(NULL,NULL);
     } else {
       struct tinywl_toplevel *next_toplevel = wl_container_of(
           toplevel->server->toplevels.next, next_toplevel, link);
