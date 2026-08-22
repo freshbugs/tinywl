@@ -146,7 +146,7 @@ struct tinywl_toplevel {
   int pending_height;
 
   // Track state
-  bool is_resizing;
+  bool is_resizing; // ie., the client is resizing and we are waiting
   bool is_maximized;
   bool is_fullscreen;
 };
@@ -254,6 +254,9 @@ static struct tinywl_toplevel *desktop_toplevel_at(struct tinywl_server *server,
 
 // Reset the cursor mode to passthrough ("normal").
 static void reset_cursor_mode(struct tinywl_server *server) {
+  if (server->grabbed_toplevel) {
+    server->grabbed_toplevel->is_resizing = false;
+  }
   server->cursor_mode = TINYWL_CURSOR_PASSTHROUGH;
   server->grabbed_toplevel = NULL;
 }
@@ -356,28 +359,15 @@ static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
   struct tinywl_toplevel *toplevel = desktop_toplevel_at(
       server, server->cursor->x, server->cursor->y, &surface, &sx, &sy);
   if (!toplevel) {
-    /* If there's no toplevel under the cursor, set the cursor image to a
-     * default. This is what makes the cursor image appear when you move it
-     * around the screen, not over any toplevels. */
+    // Over empty space, set the cursor image to a default
     wlr_cursor_set_xcursor(server->cursor, server->cursor_manager, "default");
   }
   if (surface) {
-    /*
-     * Send pointer enter and motion events.
-     *
-     * The enter event gives the surface "pointer focus", which is distinct
-     * from keyboard focus. You get pointer focus by moving the pointer over
-     * a window.
-     *
-     * Note that wlroots will avoid sending duplicate enter/motion events if
-     * the surface has already has pointer focus or if the client is already
-     * aware of the coordinates passed.
-     */
+    // Enter event gives the surface "pointer focus".
+    // wlroots will avoid sending duplicate enter/motion events.
     wlr_seat_pointer_notify_enter(seat, surface, sx, sy);
     wlr_seat_pointer_notify_motion(seat, time, sx, sy);
   } else {
-    /* Clear pointer focus so future button events and such are not sent to
-     * the last client to have the cursor over it. */
     wlr_seat_pointer_clear_focus(seat);
   }
 }
@@ -409,27 +399,31 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel,
   }
   struct tinywl_server *server = toplevel->server;
   struct wlr_seat *seat = server->seat;
+  struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
   struct wlr_surface *prev_surface = seat->keyboard_state.focused_surface;
 
   if (prev_surface == surface) {
     return; // Already focused
   }
-
-  unfocus_toplevel(server);
+  // Re-insert into the server's focused/active while pointers are good
+  if (toplevel->link.next && toplevel->link.prev) {
+    wl_list_remove(&toplevel->link);
+  }
+  wl_list_insert(&server->toplevels, &toplevel->link); 
 
   // Activate and raise the new toplevel
-  if (toplevel->xdg_toplevel && toplevel->scene_tree) {
-    wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
+  if (toplevel->scene_tree) {
     wlr_scene_node_raise_to_top(&toplevel->scene_tree->node);
   }
+
+  unfocus_toplevel(server);
   
-  // Re-insert into the server's focused/active list
+  if (toplevel->xdg_toplevel) {
+    wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
+  }
+
   wl_list_remove(&toplevel->link);
   wl_list_insert(&server->toplevels, &toplevel->link);
-
-  // Inform the seat of the keyboard focus change
-  wlr_seat_keyboard_notify_enter(seat, toplevel->xdg_toplevel->base->surface,
-                                 NULL, 0, NULL);
 
   // Clear grabbed keys
   struct tinywl_keyboard *kbd;
@@ -437,8 +431,12 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel,
     kbd->grabbed_keycode = 0;
   }
 
+
+  // Inform the seat of the keyboard focus change
+  wlr_seat_keyboard_notify_enter(seat, toplevel->xdg_toplevel->base->surface,
+                                 NULL, 0, NULL);
+
   // Focus the specific active surface (supports popups/subsurfaces)
-  struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
   if (keyboard != NULL) {
     wlr_seat_keyboard_notify_enter(seat, surface,
                                    keyboard->keycodes, keyboard->num_keycodes,
@@ -446,6 +444,7 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel,
   } else {
     wlr_seat_keyboard_notify_enter(seat, surface, NULL, 0, NULL);
   }
+
 }
 
 // For DnD
@@ -906,19 +905,36 @@ static void xdg_toplevel_request_maximize(struct wl_listener *listener, void *da
 }
 
 // This function is called every time the client updates its surface buffer.
-// Its only job is to update is_resizing. (The function name is confusing.)
+// Make it fast.
 static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
-  /* Look backward in memory to find which window this event belongs to */
-  struct tinywl_toplevel *toplevel = wl_container_of(listener,
-                                                     toplevel, commit);
+  // Look backward in memory to find which window this event belongs to 
+  struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, commit);
+  
+  // Exit early if we aren't even resizing
   if (!toplevel->is_resizing) {
     return;
   }
+
+  // Safety Check: Verify the window structure pointers are valid
+  if (!toplevel->xdg_toplevel || !toplevel->xdg_toplevel->base) {
+    return;
+  }
+
+  // Safety Check: Ensure the surface is initialized and has a scene tree
   struct wlr_xdg_surface *xdg_surface = toplevel->xdg_toplevel->base;
-  if (xdg_surface->current.geometry.width == toplevel->pending_width &&
-      xdg_surface->current.geometry.height == toplevel->pending_height) {
-    wlr_scene_node_set_position(&toplevel->scene_tree->node, 
-                                toplevel->pending_x, 
+  if (!xdg_surface->initial_commit || !toplevel->scene_tree) {
+    return;
+  }
+
+  // See if the client has finished resizing using the target geometry
+  struct wlr_box geom;
+  wlr_xdg_surface_get_geometry(xdg_surface, &geom);
+
+  if (geom.width == toplevel->pending_width &&
+      geom.height == toplevel->pending_height) {
+
+    wlr_scene_node_set_position(&toplevel->scene_tree->node,
+                                toplevel->pending_x,
                                 toplevel->pending_y);
     toplevel->is_resizing = false;
   }
