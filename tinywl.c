@@ -278,6 +278,11 @@ static void process_cursor_move(struct tinywl_server *server, uint32_t time) {
   x += dx;
   y += dy;
 
+  // check the scene tree exists before calculating position
+  if (!toplevel->scene_tree) {
+    return;
+  }
+
   wlr_scene_node_set_position(&toplevel->scene_tree->node, x, y);
 }
 
@@ -391,12 +396,13 @@ static void unfocus_toplevel(struct tinywl_server *server) {
   wlr_log(WLR_DEBUG, "Compositor focus completely cleared.");
 }
 
-static void focus_toplevel(struct tinywl_toplevel *toplevel,
-                           struct wlr_surface *surface) {
+// Unfocus the old stuff, move the new window to the top, and tell it
+static void focus_toplevel(struct tinywl_toplevel *toplevel, struct wlr_surface *surface) {
   if (toplevel == NULL) {
     wlr_log(WLR_ERROR, "Trying to focus NULL");
     return;
   }
+  
   struct tinywl_server *server = toplevel->server;
   struct wlr_seat *seat = server->seat;
   struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
@@ -405,38 +411,35 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel,
   if (prev_surface == surface) {
     return; // Already focused
   }
-  // Re-insert into the server's focused/active while pointers are good
-  if (toplevel->link.next && toplevel->link.prev) {
-    wl_list_remove(&toplevel->link);
-  }
-  wl_list_insert(&server->toplevels, &toplevel->link); 
 
-  // Activate and raise the new toplevel
+  // Clean slate: Unfocus the old window state first
+  unfocus_toplevel(server);
+
+  // Raise it in our tracker list
+  wl_list_remove(&toplevel->link);
+  wl_list_insert(&server->toplevels, &toplevel->link);
+
+  // Raise it in the scene tree
   if (toplevel->scene_tree) {
     wlr_scene_node_raise_to_top(&toplevel->scene_tree->node);
   }
 
-  unfocus_toplevel(server);
-  
+  // Notify the client
   if (toplevel->xdg_toplevel) {
     wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
   }
 
-  wl_list_remove(&toplevel->link);
-  wl_list_insert(&server->toplevels, &toplevel->link);
-
-  // Clear grabbed keys
+  // Clear grabbed keys to prevent input stuck loops
   struct tinywl_keyboard *kbd;
   wl_list_for_each(kbd, &server->keyboards, link) {
     kbd->grabbed_keycode = 0;
   }
 
+  // Seat Routing: Inform the hardware seat of the keyboard focus
+  if (!surface) {
+    return;
+  }
 
-  // Inform the seat of the keyboard focus change
-  wlr_seat_keyboard_notify_enter(seat, toplevel->xdg_toplevel->base->surface,
-                                 NULL, 0, NULL);
-
-  // Focus the specific active surface (supports popups/subsurfaces)
   if (keyboard != NULL) {
     wlr_seat_keyboard_notify_enter(seat, surface,
                                    keyboard->keycodes, keyboard->num_keycodes,
@@ -444,8 +447,8 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel,
   } else {
     wlr_seat_keyboard_notify_enter(seat, surface, NULL, 0, NULL);
   }
-
 }
+
 
 // For DnD
 static void update_drag_icon_position(struct tinywl_server *server) {
@@ -932,7 +935,9 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
 
   if (geom.width == toplevel->pending_width &&
       geom.height == toplevel->pending_height) {
-
+    if (!toplevel->scene_tree) {
+      return;
+    }
     wlr_scene_node_set_position(&toplevel->scene_tree->node,
                                 toplevel->pending_x,
                                 toplevel->pending_y);
