@@ -161,7 +161,7 @@ struct tinywl_keyboard {
   uint32_t grabbed_keycode;
 };
 
-// Struct for baby popup windows that have not yet been configured
+// Struct for baby windows that have not yet been configured
 struct tinywl_unconfigured {
   struct wlr_xdg_surface *xdg_surface;
   struct tinywl_server *server;
@@ -169,11 +169,13 @@ struct tinywl_unconfigured {
   struct wl_listener destroy;
 };
 
-// Struct to manage the popup's lifecycle
 struct tinywl_popup {
     struct wlr_xdg_surface *xdg_surface;
+    struct wl_listener map;
+    struct wl_listener unmap;
     struct wl_listener destroy;
 };
+
 
 // spawn a shell process
 static void spawn(const char *cmd) {
@@ -1050,9 +1052,25 @@ static void handle_new_toplevel(struct tinywl_server *server,
   wl_signal_add(&xdg_surface->toplevel->events.request_fullscreen, &toplevel->request_fullscreen);
 }
 
+static void handle_popup_map(struct wl_listener *listener, void *data) {
+    // Intentionally empty - wlr_scene automatically catches the map signal and reveals the node.
+    // Could trigger an input grab so clicking outside the popup closes it.
+}
+
+static void handle_popup_unmap(struct wl_listener *listener, void *data) {
+    // Intentionally empty - wlr_scene automatically catches the unmap signal and hides the node.
+    // Could restore keyboard focus to the parent.
+}
+
 static void handle_popup_destroy(struct wl_listener *listener, void *data) {
     struct tinywl_popup *popup = wl_container_of(listener, popup, destroy);
+
+    // Clean up our listeners
+    wl_list_remove(&popup->map.link);
+    wl_list_remove(&popup->unmap.link);
     wl_list_remove(&popup->destroy.link);
+
+    // Free our tracking memory (wlr_scene cleans up the nodes automatically)
     free(popup);
 }
 
@@ -1064,6 +1082,7 @@ static void handle_new_popup(struct tinywl_server *server,
 
   if (parent == NULL || parent->data == NULL) {
     wlr_log(WLR_DEBUG, "Popup parent is missing a scene node.");
+    wlr_xdg_surface_schedule_configure(xdg_surface);
     return;
   }
   struct wlr_scene_tree *parent_tree = parent->data;
@@ -1077,56 +1096,49 @@ static void handle_new_popup(struct tinywl_server *server,
                                                                    xdg_surface);
   xdg_surface->data = popup_tree;
 
-  // Setup the destroy listener
+  // Setup the listeners
+  popup->map.notify = handle_popup_map;
+  wl_signal_add(&xdg_surface->surface->events.map, &popup->map);
+  popup->unmap.notify = handle_popup_unmap;
+  wl_signal_add(&xdg_surface->surface->events.unmap, &popup->unmap);
   popup->destroy.notify = handle_popup_destroy;
   wl_signal_add(&xdg_surface->events.destroy, &popup->destroy);
-}
 
-// Handle windows that have not yet been configured
-static void handle_unconfigured_commit(struct wl_listener *listener, void *data) {
-  struct tinywl_unconfigured *unconfigured = wl_container_of(listener, unconfigured, commit);
-  struct wlr_xdg_surface *xdg_surface = unconfigured->xdg_surface;
-
-  if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_NONE) {
-    return; // Keep waiting
-  }
-
-  wl_list_remove(&unconfigured->commit.link);
-  wl_list_init(&unconfigured->commit.link);
-  wl_list_remove(&unconfigured->destroy.link);
-  wl_list_init(&unconfigured->destroy.link);
-
-  if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
-    handle_new_toplevel(unconfigured->server, xdg_surface);
-  } else if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_POPUP) {
-    handle_new_popup(unconfigured->server, xdg_surface);
-  }
-
-  free(unconfigured);
+  wlr_xdg_surface_schedule_configure(xdg_surface);
 }
 
 // If a window gets destroyed before it was configured and committed
 static void handle_unconfigured_destroy(struct wl_listener *listener, void *data) {
-    struct tinywl_unconfigured *unconfigured = wl_container_of(listener, unconfigured, destroy);
-    wl_list_remove(&unconfigured->commit.link);
-    wl_list_init(&unconfigured->commit.link);
-    wl_list_remove(&unconfigured->destroy.link);
-    wl_list_init(&unconfigured->destroy.link);
-    free(unconfigured);
+  struct tinywl_unconfigured *unconfigured = wl_container_of(listener, unconfigured, destroy);
+  wl_list_remove(&unconfigured->commit.link);
+  wl_list_init(&unconfigured->commit.link);
+  wl_list_remove(&unconfigured->destroy.link);
+  wl_list_init(&unconfigured->destroy.link);
+  free(unconfigured);
 }
 
-// Handle a new unconfigured window - give it a listener until it is configured
-static void handle_new_unconfigured_surface(struct tinywl_server *server,
-                                            struct wlr_xdg_surface *xdg_surface) {
-    struct tinywl_unconfigured *unconfigured = calloc(1, sizeof(*unconfigured));
-    unconfigured->xdg_surface = xdg_surface;
-    unconfigured->server = server;
+// Baby windows will commit with a role
+static void handle_unconfigured_commit(struct wl_listener *listener, void *data) {
+  struct tinywl_unconfigured *unconfigured = wl_container_of(listener, unconfigured, commit);
+  struct wlr_xdg_surface *xdg_surface = unconfigured->xdg_surface;
 
-    unconfigured->commit.notify = handle_unconfigured_commit;
-    wl_signal_add(&xdg_surface->surface->events.commit, &unconfigured->commit);
+  // If the client committed but still hasn't assigned a role, wait for the next commit.
+  if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_NONE) {
+    return;
+  }
 
-    unconfigured->destroy.notify = handle_unconfigured_destroy;
-    wl_signal_add(&xdg_surface->events.destroy, &unconfigured->destroy);
+  // The client has assigned a role! Dispatch it to the correct handler.
+  if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
+    handle_new_toplevel(unconfigured->server, xdg_surface);
+  } 
+  else if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_POPUP) {
+    handle_new_popup(unconfigured->server, xdg_surface);
+  }
+
+  // Clean up the temporary unconfigured tracker so it doesn't double-trigger.
+  wl_list_remove(&unconfigured->commit.link);
+  wl_list_remove(&unconfigured->destroy.link);
+  free(unconfigured);
 }
 
 // Event raised when client sends a new xdg surface to wlr_xdg_shell
@@ -1134,17 +1146,13 @@ static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
   struct tinywl_server *server = wl_container_of(listener, server, new_xdg_surface);
   struct wlr_xdg_surface *xdg_surface = data;
 
-  switch (xdg_surface->role) {
-    case WLR_XDG_SURFACE_ROLE_NONE:
-      handle_new_unconfigured_surface(server, xdg_surface);
-      break;
-    case WLR_XDG_SURFACE_ROLE_POPUP:
-      handle_new_popup(server, xdg_surface);
-      break;
-    case WLR_XDG_SURFACE_ROLE_TOPLEVEL:
-      handle_new_toplevel(server, xdg_surface);
-      break;
-  }
+  struct tinywl_unconfigured *unconfigured = calloc(1, sizeof(*unconfigured));
+  unconfigured->xdg_surface = xdg_surface;
+  unconfigured->server = server;
+  unconfigured->commit.notify = handle_unconfigured_commit;
+  wl_signal_add(&xdg_surface->surface->events.commit, &unconfigured->commit);
+  unconfigured->destroy.notify = handle_unconfigured_destroy;
+  wl_signal_add(&xdg_surface->events.destroy, &unconfigured->destroy);
 }
 
 // For xdg-activation-v1.xml - when you click on a link to open a browser
@@ -1326,31 +1334,21 @@ static void cycle_toplevels(struct tinywl_server *server) {
     return;
   }
 
-  // 1. Grab the top window we want to move
-  struct tinywl_toplevel *current =
-      wl_container_of(toplevels->next, current, link);
+  // Get front and back windows
+  struct tinywl_toplevel *front =
+      wl_container_of(toplevels->next, front, link);
+  struct tinywl_toplevel *back =
+      wl_container_of(toplevels->prev, back, link);
 
-  // 2. Find the window that is currently at the very back of our stack
-  // (toplevels->prev points to the last item in a standard Wayland wl_list)
-  struct tinywl_toplevel *back_toplevel =
-      wl_container_of(toplevels->prev, back_toplevel, link);
+  // Cycle in the scene tree and our tracking list
+  wlr_scene_node_place_below(&front->scene_tree->node, 
+                             &back->scene_tree->node);
+  wl_list_remove(&front->link);
+  wl_list_insert(toplevels->prev, &front->link);
 
-  // 3. Move the data container to the back of the memory list
-  wl_list_remove(&current->link);
-  wl_list_insert(toplevels->prev, &current->link);
-
-  // 4. Move the scene graphics directly underneath that back window!
-  // This guarantees it stays in the normal window layer and doesn't get clipped.
-  if (current != back_toplevel) {
-    wlr_scene_node_place_below(&current->scene_tree->node, 
-                               &back_toplevel->scene_tree->node);
-  }
-
-  // 5. Focus the window that has now inherited the top position
-  struct tinywl_toplevel *next =
-      wl_container_of(toplevels->next, next, link);
-
-  focus_toplevel(next, next->xdg_toplevel->base->surface);
+  // Get the new front and focus it
+  front = wl_container_of(toplevels->next, front, link);
+  focus_toplevel(front, front->xdg_toplevel->base->surface);
 }
 
 // This function assumes LOGO is held down and a key is pressed
@@ -1668,10 +1666,7 @@ int main(int argc, char *argv[]) {
   // For zxdg_output_manager_v1
   wlr_xdg_output_manager_v1_create(server.wl_display, server.output_layout);
 
-  /* Set up xdg-shell version 3. The xdg-shell is a Wayland protocol which is
-   * used for application windows. For more detail on shells, refer to
-   * https://drewdevault.com/2018/07/29/Wayland-shells.html.
-   */
+  // For xdg-shell version 3.
   wl_list_init(&server.toplevels);
   server.xdg_shell = wlr_xdg_shell_create(server.wl_display, 3);
   server.new_xdg_surface.notify = server_new_xdg_surface;
