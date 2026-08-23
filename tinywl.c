@@ -79,10 +79,10 @@ struct tinywl_server {
   struct wl_listener request_set_selection;
   struct wl_list keyboards;
   enum tinywl_cursor_mode cursor_mode;
-  struct tinywl_toplevel *grabbed_toplevel;
-  double grab_x, grab_y;  // cursor position when resize/move started
-  struct wlr_box grab_geobox;
   uint32_t resize_edges;
+  struct tinywl_toplevel *grabbed_toplevel;
+  double grabbed_cursor_x, grabbed_cursor_y;  // cursor position when resize/move started
+  struct wlr_box grabbed_geobox;
 
   struct wlr_output_layout *output_layout;
   struct wl_list outputs;
@@ -131,6 +131,10 @@ struct tinywl_toplevel {
   struct wl_listener request_move;
   struct wl_listener request_resize;
 
+  // For asynchronous resizing
+  uint32_t resize_serial;
+  int pending_x, pending_y;
+
   // added listeners for maximize, fullscreen, asynchronous resize
   struct wl_listener request_maximize;
   struct wl_listener request_fullscreen;
@@ -139,14 +143,7 @@ struct tinywl_toplevel {
   // Box to save properties before going fullscreen
   struct wlr_box saved_geometry;
 
-  // Asynchronous position tracking
-  int pending_x;
-  int pending_y;
-  int pending_width;
-  int pending_height;
-
   // Track state
-  uint32_t resize_serial;
   bool is_maximized;
   bool is_fullscreen;
 };
@@ -296,7 +293,6 @@ static void reset_cursor_mode(struct tinywl_server *server) {
   }
 }
 
-
 // Move the grabbed toplevel
 static void process_cursor_move(struct tinywl_server *server, uint32_t time) {
   struct tinywl_toplevel *toplevel = server->grabbed_toplevel;
@@ -306,7 +302,7 @@ static void process_cursor_move(struct tinywl_server *server, uint32_t time) {
   }
 
   if (wl_list_empty(&toplevel->link)) {
-    wlr_log(WLR_DEBUG, "Grabbed window was destroyed mid-move.");
+    wlr_log(WLR_DEBUG, "Grabbed window must have been destroyed mid-move.");
     reset_cursor_mode(server);
     return;
   }
@@ -317,11 +313,11 @@ static void process_cursor_move(struct tinywl_server *server, uint32_t time) {
   }
 
   // Coordinate math
-  int x = server->grab_geobox.x;
-  int y = server->grab_geobox.y;
+  int x = server->grabbed_geobox.x;
+  int y = server->grabbed_geobox.y;
 
-  int dx = server->cursor->x - server->grab_x;
-  int dy = server->cursor->y - server->grab_y;
+  int dx = server->cursor->x - server->grabbed_cursor_x;
+  int dy = server->cursor->y - server->grabbed_cursor_y;
 
   x += dx;
   y += dy;
@@ -333,25 +329,38 @@ static void process_cursor_move(struct tinywl_server *server, uint32_t time) {
 // Resize the grabbed toplevel at any corner or edge.
 static void process_cursor_resize(struct tinywl_server *server, uint32_t time) {
   struct tinywl_toplevel *toplevel = server->grabbed_toplevel;
-  if (!toplevel) {
-    return;
-  }
+
   if (toplevel->resize_serial != 0) {
     // Waiting for the client to commit
     return;
   }
 
-  struct wlr_box geom;
-  wlr_xdg_surface_get_geometry(toplevel->xdg_toplevel->base, &geom);
+  // Sanity checks
+  if (toplevel == NULL) {
+    wlr_log(WLR_ERROR, "Trying to resize a NULL.");
+    return;
+  }
 
-  int x = server->grab_geobox.x;
-  int y = server->grab_geobox.y;
-  int width = server->grab_geobox.width;
-  int height = server->grab_geobox.height;
+  if (wl_list_empty(&toplevel->link)) {
+    wlr_log(WLR_DEBUG, "Grabbed window must have been destroyed mid-resize.");
+    reset_cursor_mode(server);
+    return;
+  }
 
-  // server->grab_x and y are the cursor coordinates when the resize started
-  int dx = server->cursor->x - server->grab_x;
-  int dy = server->cursor->y - server->grab_y;
+  if (!toplevel->scene_tree) {
+    wlr_log(WLR_ERROR, "Trying to resize a NULL scene_tree.");
+    return;
+  }
+  
+  // Position and geometry when the drag started
+  int x = server->grabbed_geobox.x;
+  int y = server->grabbed_geobox.y;
+  int width = server->grabbed_geobox.width;
+  int height = server->grabbed_geobox.height;
+
+  // Mouse movement since the drag started
+  int dx = server->cursor->x - server->grabbed_cursor_x;
+  int dy = server->cursor->y - server->grabbed_cursor_y;
 
   if (server->resize_edges & WLR_EDGE_TOP) {
     y += dy;
@@ -373,24 +382,23 @@ static void process_cursor_resize(struct tinywl_server *server, uint32_t time) {
 
   if (height < min_height) {
     if (server->resize_edges & WLR_EDGE_TOP) {
-      y -= min_height - height;
+      y -= (min_height - height);
     }
     height = min_height;
   }
 
   if (width < min_width) {
     if (server->resize_edges & WLR_EDGE_LEFT) {
-      x -= min_width - width;
+      x -= (min_width - width);
     }
     width = min_width;
   }
 
-  toplevel->pending_x = x + geom.x;
-  toplevel->pending_y = y + geom.y;
-  toplevel->pending_width = width;
-  toplevel->pending_height = height;
-
-  wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel, width, height);
+  toplevel->resize_serial = 
+      wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel, width, height);
+  // Don't position until the client resizes
+  toplevel->pending_x = x;
+  toplevel->pending_y = y;
 }
 
 static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
@@ -526,7 +534,6 @@ static void update_drag_icon_position(struct tinywl_server *server) {
 
   struct wlr_scene_node *node = &server->drag_icon_tree->node;
 
-  // Direct performance optimization: 
   // If the drag icon tree node is at this layout coordinate, do nothing
   if (node->x == x && node->y == y) {
     return;
@@ -567,18 +574,20 @@ static void begin_interactive(struct tinywl_toplevel *toplevel,
   struct tinywl_server *server = toplevel->server;
   struct wlr_surface *focused_surface =
       server->seat->pointer_state.focused_surface;
-      
+
+  // Sanity checks
   if (toplevel->xdg_toplevel->base->surface !=
       wlr_surface_get_root_surface(focused_surface)) {
+    wlr_log(WLR_ERROR, "Trying to interact with a toplevel and unrelated surface");
     return;
   }
 
-  // Block actions on fullscreen windows
   if (toplevel->is_fullscreen) {
+    wlr_log(WLR_INFO, "Trying to interact with a fullscreen");
     return;
   }
 
-  // Unmaximize
+  // Unmaximize. Maximized windows do not (currently) remember their previous size.
   if (toplevel->is_maximized) {
     wlr_xdg_toplevel_set_maximized(toplevel->xdg_toplevel, false);
     toplevel->is_maximized = false;
@@ -588,62 +597,47 @@ static void begin_interactive(struct tinywl_toplevel *toplevel,
   server->cursor_mode = mode;
   server->resize_edges = edges;
 
-  server->grab_x = server->cursor->x;
-  server->grab_y = server->cursor->y;
-
-  // Get offsets for the client's border decorations
-
   struct wlr_box geom;
   wlr_xdg_surface_get_geometry(toplevel->xdg_toplevel->base, &geom);
 
-  server->grab_geobox.x = toplevel->scene_tree->node.x - geom.x;
-  server->grab_geobox.y = toplevel->scene_tree->node.y - geom.y;
-  server->grab_geobox.width = geom.width;
-  server->grab_geobox.height = geom.height;
-}
+  server->grabbed_geobox.x = toplevel->scene_tree->node.x;
+  server->grabbed_geobox.y = toplevel->scene_tree->node.y;
+  server->grabbed_geobox.width = geom.width;
+  server->grabbed_geobox.height = geom.height;
 
+  server->grabbed_cursor_x = server->cursor->x;
+  server->grabbed_cursor_y = server->cursor->y;
+}
 
 // This function is triggered by a pointer button event
 static void server_cursor_button(struct wl_listener *listener, void *data) {
   struct tinywl_server *server = wl_container_of(listener, server, cursor_button);
   struct wlr_pointer_button_event *event = data;
 
-  // Handle button release
-  if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
-    // Tell wlroots the button was released.
-    // It will notify the appropriate client if necessary.
-    wlr_seat_pointer_notify_button(server->seat, event->time_msec,
-                                   event->button, event->state);
-    reset_cursor_mode(server);
-    return;
-  }
-
-  // Find the window and sub-surface directly beneath the cursor
-  double sx, sy;
-  struct wlr_surface *surface = NULL;
-  struct tinywl_toplevel *toplevel = desktop_toplevel_at(
-      server, server->cursor->x, server->cursor->y, &surface, &sx, &sy);
-
-  // Button press on empty space
-  if (!toplevel) {
-    unfocus_toplevel(server);
-    // Tell wlroots
-    wlr_seat_pointer_notify_button(server->seat, event->time_msec,
-                                   event->button, event->state);
-    return;
+  // Button release while dragging or resizing a window
+  if (server->cursor_mode == TINYWL_CURSOR_MOVE ||
+      server->cursor_mode == TINYWL_CURSOR_RESIZE) {
+    if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
+      reset_cursor_mode(server);
+      return; // Do not notify wlroots or the client
+    }
   }
 
   // Get active keyboard hardware modifier flags
   uint32_t modifiers =
       wlr_keyboard_get_modifiers(wlr_seat_get_keyboard(server->seat));
-                                                   
+
+  // Get the surface and toplevel under the cursor
+  double sx, sy;
+  struct wlr_surface *surface = NULL;
+  struct tinywl_toplevel *toplevel = desktop_toplevel_at(
+      server, server->cursor->x, server->cursor->y, &surface, &sx, &sy);
+
   // LOGO + Left Click (Interactive Window Move)
   if ((modifiers & WLR_MODIFIER_LOGO) && (event->button == BTN_LEFT)) {
     focus_toplevel(toplevel, surface);
     begin_interactive(toplevel, TINYWL_CURSOR_MOVE, 0);
-    // Do not notify wlroots.
-    // It will handle the orphaned button release appropriately.
-    return;
+    return; // Do not notify wlroots or the client
   }
 
   // LOGO + Right Click (Interactive Window Resize)
@@ -651,15 +645,29 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
     focus_toplevel(toplevel, surface);
     begin_interactive(toplevel, TINYWL_CURSOR_RESIZE,
                       WLR_EDGE_BOTTOM | WLR_EDGE_RIGHT);
-    // Again, do not notify wlroots
+    return; // Do not notify wlroots or the client
+  }
+
+  // click on empty space or not-LOGO click on a window
+  if (event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
+    if (toplevel == NULL) { // click on empty space
+      unfocus_toplevel(server);
+      wlr_seat_pointer_notify_button(server->seat, event->time_msec,
+                                     event->button, event->state);
+    } else {  // click on a surface
+      wlr_seat_pointer_notify_button(server->seat, event->time_msec,
+                                     event->button, event->state);
+      focus_toplevel(toplevel, surface);
+    }
     return;
   }
 
-  // Fallback for an unmodified click on a surface
-  focus_toplevel(toplevel, surface);
+  // Remaining case: release event in the usual "passthrough" state
   wlr_seat_pointer_notify_button(server->seat, event->time_msec,
                                  event->button, event->state);
-}
+} 
+    
+
 
 // Function triggered by a pointer axis event, eg. scroll wheel.
 static void server_cursor_axis(struct wl_listener *listener, void *data) {
@@ -979,35 +987,25 @@ static void xdg_toplevel_request_maximize(struct wl_listener *listener, void *da
 }
 
 // This function is called every time the client updates its surface buffer.
-// Make it fast.
+// Handle a commit of a resize that now needs to be positioned.
 static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
-  // Look backward in memory to find which window this event belongs to 
   struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, commit);
   (void)data;
 
-  // Exit if we are not waiting for a resize
   if (toplevel->resize_serial == 0) {
     return;
   }
 
-  if (!toplevel->xdg_toplevel ||
-      !toplevel->xdg_toplevel->base ||
-      !toplevel->scene_tree) {
-    return;
-  }
-
   struct wlr_xdg_surface *xdg_surface = toplevel->xdg_toplevel->base;
-  if (!xdg_surface->initial_commit) {
-    return;
-  }
-
-  if (xdg_surface->current.configure_serial == toplevel->resize_serial) {
-    // update the visual layout positioning on the matching final frame
-    wlr_scene_node_set_position(&toplevel->scene_tree->node,
-                                toplevel->pending_x,
+  
+  if (xdg_surface->current.configure_serial >= toplevel->resize_serial) {
+    // We are guaranteed to have a valid pending position because resize_serial was > 0
+    wlr_scene_node_set_position(&toplevel->scene_tree->node, 
+                                toplevel->pending_x, 
                                 toplevel->pending_y);
-    // Clear the transaction serial tracker for the next move cycle
-    toplevel->resize_serial = 0;
+    
+    // This single assignment resets the state machine and unblocks the cursor handler
+    toplevel->resize_serial = 0; 
   }
 }
 
@@ -1320,6 +1318,41 @@ static bool handle_switch_vt_key(struct tinywl_server *server, uint32_t sym) {
   return false;
 }
 
+// LOGO+Tab
+static void cycle_toplevels(struct tinywl_server *server) {
+  struct wl_list *toplevels = &server->toplevels;
+
+  if (wl_list_length(toplevels) <= 1) {
+    return;
+  }
+
+  // 1. Grab the top window we want to move
+  struct tinywl_toplevel *current =
+      wl_container_of(toplevels->next, current, link);
+
+  // 2. Find the window that is currently at the very back of our stack
+  // (toplevels->prev points to the last item in a standard Wayland wl_list)
+  struct tinywl_toplevel *back_toplevel =
+      wl_container_of(toplevels->prev, back_toplevel, link);
+
+  // 3. Move the data container to the back of the memory list
+  wl_list_remove(&current->link);
+  wl_list_insert(toplevels->prev, &current->link);
+
+  // 4. Move the scene graphics directly underneath that back window!
+  // This guarantees it stays in the normal window layer and doesn't get clipped.
+  if (current != back_toplevel) {
+    wlr_scene_node_place_below(&current->scene_tree->node, 
+                               &back_toplevel->scene_tree->node);
+  }
+
+  // 5. Focus the window that has now inherited the top position
+  struct tinywl_toplevel *next =
+      wl_container_of(toplevels->next, next, link);
+
+  focus_toplevel(next, next->xdg_toplevel->base->surface);
+}
+
 // This function assumes LOGO is held down and a key is pressed
 static bool handle_quick_key(struct tinywl_server *server, uint32_t sym) {
   switch (sym) {
@@ -1330,21 +1363,19 @@ static bool handle_quick_key(struct tinywl_server *server, uint32_t sym) {
       wl_display_terminate(server->wl_display);
       return true;
     case XKB_KEY_Tab:
-      if (wl_list_length(&server->toplevels) > 1) {
-        struct tinywl_toplevel *next_toplevel =
-            wl_container_of(server->toplevels.prev, next_toplevel, link);
-        focus_toplevel(next_toplevel,
-                       next_toplevel->xdg_toplevel->base->surface);
-      }
+      cycle_toplevels(server);
       return true;
     case XKB_KEY_d:
       spawn("wofi --show drun");
       return true;
-    case XKB_KEY_q:
-      close_focused_toplevel(server);
-      return true;
     case XKB_KEY_f:
       toggle_focused_fullscreen(server);
+      return true;
+    case XKB_KEY_g:
+      spawn("play -n synth square 600 trim 0 0.3 gain -20");
+      return true;
+    case XKB_KEY_q:
+      close_focused_toplevel(server);
       return true;
     default:
       break;
