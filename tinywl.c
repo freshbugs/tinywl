@@ -48,6 +48,10 @@
 // For wlr_idle_notifier_v1
 #include <wlr/types/wlr_idle_notify_v1.h>
 
+// For wlr_xdg_decoration_manager_v1
+#include <wlr/types/wlr_xdg_decoration_v1.h>
+
+
 /* For brevity's sake, struct members are annotated where they are used. */
 enum tinywl_cursor_mode {
   TINYWL_CURSOR_PASSTHROUGH,
@@ -81,8 +85,6 @@ struct tinywl_server {
   enum tinywl_cursor_mode cursor_mode;
   uint32_t resize_edges;
   struct tinywl_toplevel *grabbed_toplevel;
-  double grabbed_cursor_x, grabbed_cursor_y;  // cursor position when resize/move started
-  struct wlr_box grabbed_geobox;
 
   struct wlr_output_layout *output_layout;
   struct wl_list outputs;
@@ -108,6 +110,14 @@ struct tinywl_server {
   struct wlr_idle_notifier_v1 *idle_notifier;
   struct wl_listener idle_away;
   struct wl_listener idle_resume;
+
+  // For wlr_xdg_decoration_manager_v1
+  struct wlr_xdg_decoration_manager_v1 *xdg_decoration_manager;
+  struct wl_listener new_toplevel_decoration;
+
+  // For asynchronous resizing
+  double grabbed_cursor_x;
+  double grabbed_cursor_y;
 };
 
 struct tinywl_output {
@@ -131,9 +141,12 @@ struct tinywl_toplevel {
   struct wl_listener request_move;
   struct wl_listener request_resize;
 
-  // For asynchronous resizing
-  uint32_t resize_serial;
-  int pending_x, pending_y;
+  struct wlr_box initial_geom; // for mouse move or resize
+  int pending_width;
+  int pending_height;
+  bool resize_is_pending;
+
+  uint32_t resize_last_resize_time_ms; // to throttle resizing
 
   // added listeners for maximize, fullscreen, asynchronous resize
   struct wl_listener request_maximize;
@@ -261,16 +274,10 @@ static struct tinywl_toplevel *desktop_toplevel_at(struct tinywl_server *server,
 // Reset the cursor mode to passthrough.
 static void reset_cursor_mode(struct tinywl_server *server) {
   if (server->cursor_mode == TINYWL_CURSOR_PASSTHROUGH) {
-    wlr_log(WLR_DEBUG, "Trying to reset an already-reset cursor mode.");
+    wlr_log(WLR_INFO, "Trying to reset an already-reset cursor mode.");
     return;
   }
 
-  // If a window is currently bound to the grab, clear it
-  if (server->grabbed_toplevel &&
-      !wl_list_empty(&server->grabbed_toplevel->link)) {
-    server->grabbed_toplevel->resize_serial = 0;
-  }
-  
   // Clear out the server tracking state fields
   server->cursor_mode = TINYWL_CURSOR_PASSTHROUGH;
   server->grabbed_toplevel = NULL;
@@ -296,7 +303,7 @@ static void reset_cursor_mode(struct tinywl_server *server) {
 }
 
 // Move the grabbed toplevel
-static void process_cursor_move(struct tinywl_server *server, uint32_t time) {
+static void handle_cursor_move(struct tinywl_server *server, uint32_t time) {
   struct tinywl_toplevel *toplevel = server->grabbed_toplevel;
   if (toplevel == NULL) {
     wlr_log(WLR_ERROR, "Trying to drag a NULL.");
@@ -304,7 +311,7 @@ static void process_cursor_move(struct tinywl_server *server, uint32_t time) {
   }
 
   if (wl_list_empty(&toplevel->link)) {
-    wlr_log(WLR_DEBUG, "Grabbed window must have been destroyed mid-move.");
+    wlr_log(WLR_INFO, "Grabbed window must have been destroyed mid-move.");
     reset_cursor_mode(server);
     return;
   }
@@ -315,8 +322,8 @@ static void process_cursor_move(struct tinywl_server *server, uint32_t time) {
   }
 
   // Coordinate math
-  int x = server->grabbed_geobox.x;
-  int y = server->grabbed_geobox.y;
+  int x = toplevel->initial_geom.x;
+  int y = toplevel->initial_geom.y;
 
   int dx = server->cursor->x - server->grabbed_cursor_x;
   int dy = server->cursor->y - server->grabbed_cursor_y;
@@ -329,87 +336,76 @@ static void process_cursor_move(struct tinywl_server *server, uint32_t time) {
 }
 
 // Resize the grabbed toplevel at any corner or edge.
-static void process_cursor_resize(struct tinywl_server *server, uint32_t time) {
+static void handle_cursor_resize(struct tinywl_server *server, uint32_t time) {
   struct tinywl_toplevel *toplevel = server->grabbed_toplevel;
 
-  if (toplevel->resize_serial != 0) {
-    // Waiting for the client to commit
-    return;
-  }
+  wlr_seat_pointer_notify_motion(server->seat, time, server->cursor->x, server->cursor->y);
 
   // Sanity checks
   if (toplevel == NULL) {
     wlr_log(WLR_ERROR, "Trying to resize a NULL.");
     return;
   }
-
   if (wl_list_empty(&toplevel->link)) {
     wlr_log(WLR_DEBUG, "Grabbed window must have been destroyed mid-resize.");
     reset_cursor_mode(server);
     return;
   }
-
   if (!toplevel->scene_tree) {
     wlr_log(WLR_ERROR, "Trying to resize a NULL scene_tree.");
     return;
   }
-  
-  // Position and geometry when the drag started
-  int x = server->grabbed_geobox.x;
-  int y = server->grabbed_geobox.y;
-  int width = server->grabbed_geobox.width;
-  int height = server->grabbed_geobox.height;
 
   // Mouse movement since the drag started
   int dx = server->cursor->x - server->grabbed_cursor_x;
   int dy = server->cursor->y - server->grabbed_cursor_y;
 
+  int width = toplevel->initial_geom.width;
+  int height = toplevel->initial_geom.height;
+
   if (server->resize_edges & WLR_EDGE_TOP) {
-    y += dy;
     height -= dy;
   } else if (server->resize_edges & WLR_EDGE_BOTTOM) {
     height += dy;
   }
   if (server->resize_edges & WLR_EDGE_LEFT) {
-    x += dx;
     width -= dx;
   } else if (server->resize_edges & WLR_EDGE_RIGHT) {
     width += dx;
   }
-    
-  int min_width = 50;
-  int min_height = 50;
-  // TO DO: set these to client preferences, with sanity checks
-  // int client_min_width = toplevel->xdg_toplevel->current.min_width; ...
-
+  
+  // Clamp
+  int min_width = toplevel->xdg_toplevel->current.min_width;
+  int min_height = toplevel->xdg_toplevel->current.min_height;
   if (height < min_height) {
-    if (server->resize_edges & WLR_EDGE_TOP) {
-      y -= (min_height - height);
-    }
     height = min_height;
   }
-
   if (width < min_width) {
-    if (server->resize_edges & WLR_EDGE_LEFT) {
-      x -= (min_width - width);
-    }
     width = min_width;
   }
 
-  toplevel->resize_serial = 
-      wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel, width, height);
-  // Don't position until the client resizes
-  toplevel->pending_x = x;
-  toplevel->pending_y = y;
+  toplevel->pending_width = width;
+  toplevel->pending_height = height;
+  toplevel->resize_is_pending = true;
 }
 
-static void process_cursor_motion(struct tinywl_server *server, uint32_t time) {
+static void handle_cursor_motion(struct tinywl_server *server, uint32_t time) {
+
+  // Always send coordinates to clients
+  wlr_seat_pointer_notify_motion(server->seat, time, server->cursor->x, server->cursor->y);
+
+  // Hack to force the clock to tick when running nested
+  struct tinywl_output *output;
+    wl_list_for_each(output, &server->outputs, link) {
+        wlr_output_schedule_frame(output->wlr_output);
+  }
+
   // If the mode is non-passthrough, delegate to those functions.
   if (server->cursor_mode == TINYWL_CURSOR_MOVE) {
-    process_cursor_move(server, time);
+    handle_cursor_move(server, time);
     return;
   } else if (server->cursor_mode == TINYWL_CURSOR_RESIZE) {
-    process_cursor_resize(server, time);
+    handle_cursor_resize(server, time);
     return;
   }
 
@@ -552,7 +548,7 @@ static void server_cursor_motion(struct wl_listener *listener, void *data) {
   struct wlr_pointer_motion_event *event = data;
   wlr_cursor_move(server->cursor, &event->pointer->base,
                   event->delta_x, event->delta_y);
-  process_cursor_motion(server, event->time_msec);
+  handle_cursor_motion(server, event->time_msec);
   update_drag_icon_position(server); // for DnD
   wlr_idle_notifier_v1_notify_activity(server->idle_notifier, server->seat);
 }
@@ -566,7 +562,7 @@ static void server_cursor_motion_absolute(struct wl_listener *listener,
   struct wlr_pointer_motion_absolute_event *event = data;
   wlr_cursor_warp_absolute(server->cursor, &event->pointer->base,
                            event->x, event->y);
-  process_cursor_motion(server, event->time_msec);
+  handle_cursor_motion(server, event->time_msec);
   wlr_idle_notifier_v1_notify_activity(server->idle_notifier, server->seat);
 }
 
@@ -577,19 +573,19 @@ static void begin_interactive(struct tinywl_toplevel *toplevel,
   struct wlr_surface *focused_surface =
       server->seat->pointer_state.focused_surface;
 
-  // Sanity checks
+  // Sanity check
   if (toplevel->xdg_toplevel->base->surface !=
       wlr_surface_get_root_surface(focused_surface)) {
     wlr_log(WLR_ERROR, "Trying to interact with a toplevel and unrelated surface");
     return;
   }
 
+  // fullscreen
   if (toplevel->is_fullscreen) {
-    wlr_log(WLR_INFO, "Trying to interact with a fullscreen");
     return;
   }
 
-  // Unmaximize. Maximized windows do not (currently) remember their previous size.
+  // Unmaximize. Maximized windows do not remember their previous size.
   if (toplevel->is_maximized) {
     wlr_xdg_toplevel_set_maximized(toplevel->xdg_toplevel, false);
     toplevel->is_maximized = false;
@@ -602,13 +598,15 @@ static void begin_interactive(struct tinywl_toplevel *toplevel,
   struct wlr_box geom;
   wlr_xdg_surface_get_geometry(toplevel->xdg_toplevel->base, &geom);
 
-  server->grabbed_geobox.x = toplevel->scene_tree->node.x;
-  server->grabbed_geobox.y = toplevel->scene_tree->node.y;
-  server->grabbed_geobox.width = geom.width;
-  server->grabbed_geobox.height = geom.height;
-
+  // save the initial state of the window and cursor
+  toplevel->initial_geom.x = toplevel->scene_tree->node.x;
+  toplevel->initial_geom.y = toplevel->scene_tree->node.y;
+  toplevel->initial_geom.width = geom.width;
+  toplevel->initial_geom.height = geom.height;
   server->grabbed_cursor_x = server->cursor->x;
   server->grabbed_cursor_y = server->cursor->y;
+
+  toplevel->resize_is_pending = false;
 }
 
 // This function is triggered by a pointer button event
@@ -690,7 +688,19 @@ static void server_cursor_frame(struct wl_listener *listener, void *data) {
 // Function called every time an output is ready to display a frame, eg 60Hz
 static void output_frame(struct wl_listener *listener, void *data) {
   struct tinywl_output *output = wl_container_of(listener, output, frame);
-  struct wlr_scene *scene = output->server->scene;
+  struct tinywl_server *server = output->server;
+  struct wlr_scene *scene = server->scene;
+
+  // Send resizing requests here, so they "only" get sent at the frame rate
+  if (server->cursor_mode == TINYWL_CURSOR_RESIZE) {
+    struct tinywl_toplevel *toplevel = server->grabbed_toplevel;
+    if (toplevel->resize_is_pending) {
+      wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel, toplevel->pending_width,
+                                toplevel->pending_height);
+      wlr_xdg_surface_schedule_configure(toplevel->xdg_toplevel->base);
+      toplevel->resize_is_pending = false;
+    }
+  }
 
   struct wlr_scene_output *scene_output =
       wlr_scene_get_scene_output(scene, output->wlr_output);
@@ -773,7 +783,7 @@ static void server_new_output(struct wl_listener *listener, void *data) {
       wlr_scene_output_create(server->scene, wlr_output);
 
   // Background color
-  float background_color[4] = {0.25f, 0.05f, 0.05f, 1.0f};
+  float background_color[4] = {0.02f, 0.20f, 0.20f, 1.0f};
   wlr_scene_rect_create(&server->scene->tree, 
                         wlr_output->width, 
                         wlr_output->height, 
@@ -989,25 +999,38 @@ static void xdg_toplevel_request_maximize(struct wl_listener *listener, void *da
 }
 
 // This function is called every time the client updates its surface buffer.
-// Handle a commit of a resize that now needs to be positioned.
+// Adjust the boundaries of the scene graph node so the frame can be drawn.
 static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
   struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, commit);
-  (void)data;
+  struct tinywl_server *server = toplevel->server;
+  struct wlr_xdg_surface *xdg_surface = toplevel->xdg_toplevel->base;
 
-  if (toplevel->resize_serial == 0) {
+  // Do nothing on an initial commit
+  if (xdg_surface->initial_commit) {
     return;
   }
 
-  struct wlr_xdg_surface *xdg_surface = toplevel->xdg_toplevel->base;
-  
-  if (xdg_surface->current.configure_serial >= toplevel->resize_serial) {
-    // We are guaranteed to have a valid pending position because resize_serial was > 0
-    wlr_scene_node_set_position(&toplevel->scene_tree->node, 
-                                toplevel->pending_x, 
-                                toplevel->pending_y);
-    
-    // This single assignment resets the state machine and unblocks the cursor handler
-    toplevel->resize_serial = 0; 
+  // Extract the actual geometry the application just committed
+
+  // Do nothing UNLESS we are actively resizing from top/left edges
+  if (server->cursor_mode == TINYWL_CURSOR_RESIZE) {
+    struct wlr_box geom;
+    wlr_xdg_surface_get_geometry(xdg_surface, &geom);
+
+    if (server->resize_edges & (WLR_EDGE_LEFT | WLR_EDGE_TOP)) {
+      int32_t x = toplevel->initial_geom.x;
+      int32_t y = toplevel->initial_geom.y;
+
+      if (server->resize_edges & WLR_EDGE_LEFT) {
+        x += toplevel->initial_geom.width - geom.width;
+      }
+      if (server->resize_edges & WLR_EDGE_TOP) {
+        y += toplevel->initial_geom.height - geom.height;
+      }
+
+      // Reposition the window node on screen to keep the anchor point pinned
+      wlr_scene_node_set_position(&toplevel->scene_tree->node, x, y);
+    }
   }
 }
 
@@ -1106,6 +1129,15 @@ static void handle_new_popup(struct tinywl_server *server,
 
   wlr_xdg_surface_schedule_configure(xdg_surface);
 }
+
+// For wlr_xdg_decoration_manager_v1
+static void handle_new_toplevel_decoration(struct wl_listener *listener, void *data) {
+  struct wlr_xdg_toplevel_decoration_v1 *decoration = data;
+  // Tell the client to draw its own window decorations
+  wlr_xdg_toplevel_decoration_v1_set_mode(decoration, 
+        WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
+}
+
 
 // If a window gets destroyed before it was configured and committed
 static void handle_unconfigured_destroy(struct wl_listener *listener, void *data) {
@@ -1539,12 +1571,9 @@ static void seat_request_cursor(struct wl_listener *listener, void *data) {
   }
 }
 
+// The seat raises a request when the client wants to set the selection
 static void seat_request_set_selection(struct wl_listener *listener,
                                        void *data) {
-  /* This event is raised by the seat when a client wants to set the selection,
-   * usually when the user copies something. wlroots allows compositors to
-   * ignore such requests if they so choose, but in tinywl we always honor
-   */
   struct tinywl_server *server =
       wl_container_of(listener, server, request_set_selection);
   struct wlr_seat_request_set_selection_event *event = data;
@@ -1708,6 +1737,11 @@ int main(int argc, char *argv[]) {
   server.cursor_frame.notify = server_cursor_frame;
   wl_signal_add(&server.cursor->events.frame, &server.cursor_frame);
 
+  // For wlr_xdg_decoration_manager_v1
+  server.xdg_decoration_manager = wlr_xdg_decoration_manager_v1_create(server.wl_display);
+  server.new_toplevel_decoration.notify = handle_new_toplevel_decoration;
+  wl_signal_add(&server.xdg_decoration_manager->events.new_toplevel_decoration, 
+                &server.new_toplevel_decoration);
 
   // For wlr_idle_notifier_v1
   server.idle_notifier = wlr_idle_notifier_v1_create(server.wl_display);
