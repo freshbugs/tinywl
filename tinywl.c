@@ -51,7 +51,6 @@
 // For wlr_xdg_decoration_manager_v1
 #include <wlr/types/wlr_xdg_decoration_v1.h>
 
-
 /* For brevity's sake, struct members are annotated where they are used. */
 enum tinywl_cursor_mode {
   TINYWL_CURSOR_PASSTHROUGH,
@@ -59,10 +58,15 @@ enum tinywl_cursor_mode {
   TINYWL_CURSOR_RESIZE,
 };
 
+enum tinywl_surface_type {
+  TINYWL_SURFACE_TOPLEVEL,
+  TINYWL_SURFACE_POPUP,
+};
+
 struct tinywl_server {
   struct wl_display *wl_display;
   struct wlr_backend *backend;
-  struct wlr_session *session; // added
+  struct wlr_session *session; // added for TTY switching
   struct wlr_renderer *renderer;
 
   struct wlr_xdg_shell *xdg_shell;
@@ -130,6 +134,7 @@ struct tinywl_output {
 };
 
 struct tinywl_toplevel {
+  enum tinywl_surface_type type;  // added
   struct wl_list link;
   struct tinywl_server *server;
   struct wlr_xdg_toplevel *xdg_toplevel;
@@ -141,12 +146,11 @@ struct tinywl_toplevel {
   struct wl_listener request_move;
   struct wl_listener request_resize;
 
-  struct wlr_box initial_geom; // for mouse move or resize
+  // Added for moving windows, or resizing them throttled to the frame rate
+  struct wlr_box initial_geom;
   int pending_width;
   int pending_height;
   bool resize_is_pending;
-
-  uint32_t resize_last_resize_time_ms; // to throttle resizing
 
   // added listeners for maximize, fullscreen, asynchronous resize
   struct wl_listener request_maximize;
@@ -174,21 +178,14 @@ struct tinywl_keyboard {
   uint32_t grabbed_keycode;
 };
 
-// Struct for baby windows that have not yet been configured
-struct tinywl_unconfigured {
-  struct wlr_xdg_surface *xdg_surface;
-  struct tinywl_server *server;
+// For xdg_popup
+struct tinywl_popup {
+  enum tinywl_surface_type type;
+  struct wlr_xdg_popup *xdg_popup;
+  struct wlr_scene_tree *scene_tree;
   struct wl_listener commit;
   struct wl_listener destroy;
 };
-
-struct tinywl_popup {
-    struct wlr_xdg_surface *xdg_surface;
-    struct wl_listener map;
-    struct wl_listener unmap;
-    struct wl_listener destroy;
-};
-
 
 // spawn a shell process
 static void spawn(const char *cmd) {
@@ -259,16 +256,18 @@ static struct tinywl_toplevel *desktop_toplevel_at(struct tinywl_server *server,
   
   // Climb the tree to find our custom tinywl_toplevel data pointer
   struct wlr_scene_tree *tree = node->parent;
-  while (tree != NULL && tree->node.data == NULL) {
+  while (tree != NULL) {
+    if (tree->node.data != NULL) {
+      // Get the type. This is safe since it's the first member of both structs
+      enum tinywl_surface_type *surface_type = tree->node.data;
+      if (*surface_type == TINYWL_SURFACE_TOPLEVEL) {
+        return tree->node.data;
+      }
+    }
     tree = tree->node.parent;
   }
   
-  // If we hit the root of the tree without finding a window structure,
-  if (tree == NULL) {
-      return NULL;
-  }
-  
-  return tree->node.data;
+  return NULL;
 }
 
 // Reset the cursor mode to passthrough.
@@ -1039,6 +1038,7 @@ static void handle_new_toplevel(struct tinywl_server *server,
   struct tinywl_toplevel *toplevel = calloc(1, sizeof(*toplevel));
   toplevel->server = server;
   toplevel->xdg_toplevel = xdg_surface->toplevel;
+  toplevel->type = TINYWL_SURFACE_TOPLEVEL;
 
   // Attach to the scene graph
   toplevel->scene_tree = wlr_scene_xdg_surface_create(&server->scene->tree,
@@ -1075,60 +1075,59 @@ static void handle_new_toplevel(struct tinywl_server *server,
   wl_signal_add(&xdg_surface->toplevel->events.request_fullscreen, &toplevel->request_fullscreen);
 }
 
-static void handle_popup_map(struct wl_listener *listener, void *data) {
-    // Intentionally empty - wlr_scene automatically catches the map signal and reveals the node.
-    // Could trigger an input grab so clicking outside the popup closes it.
+static void popup_handle_commit(struct wl_listener *listener, void *data) {
+    // In wlroots 0.17, committing a popup surface requires scheduling a repaint
+    struct tinywl_popup *popup = wl_container_of(listener, popup, commit);
+    wlr_log(WLR_DEBUG, "popup handle commit.");
+    
+    if (popup->xdg_popup->base->initial_commit) {
+        // First commit, nothing to damage yet
+        return;
+    }
+    
+    // Optional: If you implemented scene-graph or manual tracking, 
+    // you would trigger a frame damage event here. 
+    // For raw tinywl, the main output frame loop handles general rendering.
 }
 
-static void handle_popup_unmap(struct wl_listener *listener, void *data) {
-    // Intentionally empty - wlr_scene automatically catches the unmap signal and hides the node.
-    // Could restore keyboard focus to the parent.
+static void popup_handle_destroy(struct wl_listener *listener, void *data) {
+  wlr_log(WLR_DEBUG, "popup handle destroy.");
+  struct tinywl_popup *popup = wl_container_of(listener, popup, destroy);
+
+  wl_list_remove(&popup->commit.link);
+  wl_list_remove(&popup->destroy.link);
+  
+  free(popup);
 }
 
-static void handle_popup_destroy(struct wl_listener *listener, void *data) {
-    struct tinywl_popup *popup = wl_container_of(listener, popup, destroy);
 
-    // Clean up our listeners
-    wl_list_remove(&popup->map.link);
-    wl_list_remove(&popup->unmap.link);
-    wl_list_remove(&popup->destroy.link);
-
-    // Free our tracking memory (wlr_scene cleans up the nodes automatically)
-    free(popup);
-}
-
-static void handle_new_popup(struct tinywl_server *server,
-                             struct wlr_xdg_surface *xdg_surface) {
-  // Find the parent surface's scene tree node
-  struct wlr_xdg_surface *parent = 
-    wlr_xdg_surface_try_from_wlr_surface(xdg_surface->popup->parent);
-
-  if (parent == NULL || parent->data == NULL) {
-    wlr_log(WLR_DEBUG, "Popup parent is missing a scene node.");
-    wlr_xdg_surface_schedule_configure(xdg_surface);
+static void handle_new_popup(struct tinywl_server *server, struct wlr_xdg_popup *xdg_popup) {
+  wlr_log(WLR_DEBUG, "popup handle destroy.");
+  struct tinywl_popup *popup = calloc(1, sizeof(struct tinywl_popup));
+  popup->type = TINYWL_SURFACE_POPUP;
+  if (!popup) {
     return;
   }
-  struct wlr_scene_tree *parent_tree = parent->data;
 
-  // Allocate a tracking structure for this popup's lifecycle
-  struct tinywl_popup *popup = calloc(1, sizeof(*popup));
-  popup->xdg_surface = xdg_surface;
+  popup->xdg_popup = xdg_popup;
 
-  // Create the scene node and save it to xdg_surface->data
-  struct wlr_scene_tree *popup_tree = wlr_scene_xdg_surface_create(parent_tree,
-                                                                   xdg_surface);
-  xdg_surface->data = popup_tree;
+  // Attach to the scene graph tree. wlroots 0.17 handles nested submenus 
+  // automatically if we pass the primary scene tree root.
+  popup->scene_tree = wlr_scene_xdg_surface_create(&server->scene->tree, xdg_popup->base);
+  if (!popup->scene_tree) {
+    free(popup);
+    return;
+  }
 
-  // Setup the listeners
-  popup->map.notify = handle_popup_map;
-  wl_signal_add(&xdg_surface->surface->events.map, &popup->map);
-  popup->unmap.notify = handle_popup_unmap;
-  wl_signal_add(&xdg_surface->surface->events.unmap, &popup->unmap);
-  popup->destroy.notify = handle_popup_destroy;
-  wl_signal_add(&xdg_surface->events.destroy, &popup->destroy);
+  popup->scene_tree->node.data = popup;
 
-  wlr_xdg_surface_schedule_configure(xdg_surface);
+  popup->commit.notify = popup_handle_commit;
+  wl_signal_add(&xdg_popup->base->surface->events.commit, &popup->commit);
+
+  popup->destroy.notify = popup_handle_destroy;
+  wl_signal_add(&xdg_popup->base->events.destroy, &popup->destroy);
 }
+
 
 // For wlr_xdg_decoration_manager_v1
 static void handle_new_toplevel_decoration(struct wl_listener *listener, void *data) {
@@ -1139,52 +1138,18 @@ static void handle_new_toplevel_decoration(struct wl_listener *listener, void *d
 }
 
 
-// If a window gets destroyed before it was configured and committed
-static void handle_unconfigured_destroy(struct wl_listener *listener, void *data) {
-  struct tinywl_unconfigured *unconfigured = wl_container_of(listener, unconfigured, destroy);
-  wl_list_remove(&unconfigured->commit.link);
-  wl_list_init(&unconfigured->commit.link);
-  wl_list_remove(&unconfigured->destroy.link);
-  wl_list_init(&unconfigured->destroy.link);
-  free(unconfigured);
-}
-
-// Baby windows will commit with a role
-static void handle_unconfigured_commit(struct wl_listener *listener, void *data) {
-  struct tinywl_unconfigured *unconfigured = wl_container_of(listener, unconfigured, commit);
-  struct wlr_xdg_surface *xdg_surface = unconfigured->xdg_surface;
-
-  // If the client committed but still hasn't assigned a role, wait for the next commit.
-  if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_NONE) {
-    return;
-  }
-
-  // The client has assigned a role! Dispatch it to the correct handler.
-  if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
-    handle_new_toplevel(unconfigured->server, xdg_surface);
-  } 
-  else if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_POPUP) {
-    handle_new_popup(unconfigured->server, xdg_surface);
-  }
-
-  // Clean up the temporary unconfigured tracker so it doesn't double-trigger.
-  wl_list_remove(&unconfigured->commit.link);
-  wl_list_remove(&unconfigured->destroy.link);
-  free(unconfigured);
-}
-
 // Event raised when client sends a new xdg surface to wlr_xdg_shell
 static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
   struct tinywl_server *server = wl_container_of(listener, server, new_xdg_surface);
   struct wlr_xdg_surface *xdg_surface = data;
 
-  struct tinywl_unconfigured *unconfigured = calloc(1, sizeof(*unconfigured));
-  unconfigured->xdg_surface = xdg_surface;
-  unconfigured->server = server;
-  unconfigured->commit.notify = handle_unconfigured_commit;
-  wl_signal_add(&xdg_surface->surface->events.commit, &unconfigured->commit);
-  unconfigured->destroy.notify = handle_unconfigured_destroy;
-  wl_signal_add(&xdg_surface->events.destroy, &unconfigured->destroy);
+  if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
+    handle_new_toplevel(server, xdg_surface); 
+  } else if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_POPUP) {
+    handle_new_popup(server, xdg_surface->popup);
+  } else {
+    wlr_log(WLR_ERROR, "new surface with no ROLE.");
+  }
 }
 
 // For xdg-activation-v1.xml - when you click on a link to open a browser
