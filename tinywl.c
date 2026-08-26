@@ -451,29 +451,36 @@ static void handle_cursor_motion(struct tinywl_server *server, uint32_t time) {
       break;
   }
 
-  // Otherwise, find the toplevel under the pointer and send the event along.
-  double sx, sy; 
+  // Find the exact scene graph node under the cursor
+  double sx, sy;
   struct wlr_seat *seat = server->seat;
   struct wlr_surface *surface = NULL;
-  struct tinywl_toplevel *toplevel = desktop_toplevel_at(
-      server, server->cursor->x, server->cursor->y, &surface, &sx, &sy);
-  
-  if (!toplevel) {
-    // Over empty space, set the cursor image to a default arrow
-    wlr_cursor_set_xcursor(server->cursor, server->cursor_manager, "default");
+
+  // Use the scene graph root directly to see absolutely everything rendered
+  struct wlr_scene_node *node = wlr_scene_node_at(
+      &server->scene->tree.node, server->cursor->x, server->cursor->y, &sx, &sy);
+
+  if (node && node->type == WLR_SCENE_NODE_BUFFER) {
+    struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
+    struct wlr_scene_surface *scene_surface = wlr_scene_surface_try_from_buffer(scene_buffer);
+    
+    if (scene_surface) {
+      surface = scene_surface->surface;
+    }
   }
 
-  if (surface) {
-    // Enter event gives the surface "pointer focus".
-    // wlroots will avoid sending duplicate enter/motion events.
+  if (!surface) {
+    // Over empty space, set the cursor image to a default arrow
+    wlr_cursor_set_xcursor(server->cursor, server->cursor_manager, "default");
+    wlr_seat_pointer_clear_focus(seat);
+  } else {
+    // wlroots handles duplicate protection internally.
+    // sx and sy are already transformed into the local surface coordinate space.
     wlr_seat_pointer_notify_enter(seat, surface, sx, sy);
     wlr_seat_pointer_notify_motion(seat, time, sx, sy);
-  } else {
-    // The cursor is either on empty space OR window borders.
-    // Clear client-side focus without breaking compositor graphics states.
-    wlr_seat_pointer_clear_focus(seat);
   }
 }
+
 
 // Unfocus
 static void unfocus_toplevel(struct tinywl_server *server) {
@@ -518,7 +525,7 @@ static void raise_toplevel(struct tinywl_toplevel *toplevel) {
   }
 }
 
-// Unfocus the old stuff, move the new window to the top, and tell it
+// Unfocus the old stuff, move the new window to the top, and notify it
 static void focus_toplevel(struct tinywl_toplevel *toplevel,
                            struct wlr_surface *surface) {
   if (toplevel == NULL || surface == NULL) {
@@ -548,8 +555,16 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel,
     return;
   }
       
-  // Safe to activate and pass to the seat engine now
-  wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
+  // For dialog boxes
+  struct wlr_xdg_surface *xdg_surface = wlr_xdg_surface_try_from_wlr_surface(surface);
+  if (xdg_surface && xdg_surface->toplevel) {
+    // If you clicked the dialog box, this activates the dialog box.
+    // If you clicked the main window, this activates the main window.
+    wlr_xdg_toplevel_set_activated(xdg_surface->toplevel, true);
+  } else {
+    // Fallback security measure
+    wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
+  }
 
   if (keyboard == NULL) {
     wlr_log(WLR_INFO, "Focusing with no keyboard.");
