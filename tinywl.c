@@ -119,9 +119,13 @@ struct tinywl_server {
   struct wlr_xdg_decoration_manager_v1 *xdg_decoration_manager;
   struct wl_listener new_toplevel_decoration;
 
-  // For asynchronous resizing
+  // For drag or resize
   double grabbed_cursor_x;
   double grabbed_cursor_y;
+
+  // Up to two grabbed mouse buttons - to start and cancel an interaction
+  uint32_t grabbed_active_button;
+  uint32_t grabbed_cancel_button;
 };
 
 struct tinywl_output {
@@ -174,8 +178,7 @@ struct tinywl_keyboard {
   struct wl_listener key;
   struct wl_listener destroy;
 
-  // For keeping track of keypresses not told to the client
-  uint32_t grabbed_keycode;
+  uint32_t grabbed_keycode; // keypress not told to the client
 };
 
 // For xdg_popup
@@ -203,43 +206,41 @@ static void spawn(const char *cmd) {
 
 // For wlr_idle_notifier_v1
 static void handle_idle_away(struct wl_listener *listener, void *data) {
-    struct tinywl_server *server = wl_container_of(listener, server, idle_away);
-    
-    // Loop through all connected monitors/outputs and turn them off
-    struct tinywl_output *output;
-    wl_list_for_each(output, &server->outputs, link) {
-        struct wlr_output_state state;
-        wlr_output_state_init(&state);
-        wlr_output_state_set_enabled(&state, false); // Disable display output
-        wlr_output_commit_state(output->wlr_output, &state);
-        wlr_output_state_finish(&state);
-    }
+  struct tinywl_server *server = wl_container_of(listener, server, idle_away);
+  
+  // Loop through all connected monitors/outputs and turn them off
+  struct tinywl_output *output;
+  wl_list_for_each(output, &server->outputs, link) {
+    struct wlr_output_state state;
+    wlr_output_state_init(&state);
+    wlr_output_state_set_enabled(&state, false); // Disable display output
+    wlr_output_commit_state(output->wlr_output, &state);
+    wlr_output_state_finish(&state);
+  }
 }
 
 // For wlr_idle_notifier_v1
 static void handle_idle_resume(struct wl_listener *listener, void *data) {
-    struct tinywl_server *server = wl_container_of(listener, server, idle_resume);
+  struct tinywl_server *server = wl_container_of(listener, server, idle_resume);
+   
+  // The user moved the mouse! Turn all monitors back on
+  struct tinywl_output *output;
+  wl_list_for_each(output, &server->outputs, link) {
+    struct wlr_output_state state;
+    wlr_output_state_init(&state);
+    wlr_output_state_set_enabled(&state, true); // Re-enable display output
+    wlr_output_commit_state(output->wlr_output, &state);
+    wlr_output_state_finish(&state);
     
-    // The user moved the mouse! Turn all monitors back on
-    struct tinywl_output *output;
-    wl_list_for_each(output, &server->outputs, link) {
-        struct wlr_output_state state;
-        wlr_output_state_init(&state);
-        wlr_output_state_set_enabled(&state, true); // Re-enable display output
-        wlr_output_commit_state(output->wlr_output, &state);
-        wlr_output_state_finish(&state);
-        
-        // Schedule a frame redraw immediately so the screen isn't blank
-        wlr_output_schedule_frame(output->wlr_output);
-    }
+    // Schedule a frame redraw immediately so the screen isn't blank
+    wlr_output_schedule_frame(output->wlr_output);
+  }
 }
 
 // Return the toplevel responsible for a given pixel.
 // Also set surface and relative coordinates.
 static struct tinywl_toplevel *desktop_toplevel_at(struct tinywl_server *server,
-                                                   double lx, double ly,
-                                                   struct wlr_surface **surface,
-                                                   double *sx, double *sy) {
+    double lx, double ly, struct wlr_surface **surface, double *sx, double *sy) {
   struct wlr_scene_node *node =
       wlr_scene_node_at(&server->scene->tree.node, lx, ly, sx, sy);
   if (node == NULL || node->type != WLR_SCENE_NODE_BUFFER) {
@@ -271,9 +272,8 @@ static struct tinywl_toplevel *desktop_toplevel_at(struct tinywl_server *server,
 }
 
 // Reset the cursor mode to passthrough.
-static void reset_cursor_mode(struct tinywl_server *server) {
+static void end_interactive(struct tinywl_server *server) {
   if (server->cursor_mode == TINYWL_CURSOR_PASSTHROUGH) {
-    wlr_log(WLR_INFO, "Trying to reset an already-reset cursor mode.");
     return;
   }
 
@@ -301,8 +301,50 @@ static void reset_cursor_mode(struct tinywl_server *server) {
   }
 }
 
+// Set up an interactive move/resize, where the compositor grabs mouse events
+static void begin_interactive(struct tinywl_toplevel *toplevel,
+                              enum tinywl_cursor_mode mode, uint32_t edges) {
+  struct tinywl_server *server = toplevel->server;
+  struct wlr_surface *focused_surface =
+      server->seat->pointer_state.focused_surface;
+
+  // Sanity check
+  if (toplevel->xdg_toplevel->base->surface !=
+      wlr_surface_get_root_surface(focused_surface)) {
+    wlr_log(WLR_ERROR, "Trying to interact with a toplevel and unrelated surface");
+    return;
+  }
+
+  // fullscreen
+  if (toplevel->is_fullscreen) {
+    return;
+  }
+
+  // Unmaximize. Maximized windows do not remember their previous size.
+  if (toplevel->is_maximized) {
+    wlr_xdg_toplevel_set_maximized(toplevel->xdg_toplevel, false);
+    toplevel->is_maximized = false;
+  }
+
+  server->grabbed_toplevel = toplevel;
+  server->cursor_mode = mode;
+  server->resize_edges = edges;
+
+  struct wlr_box geom;
+  wlr_xdg_surface_get_geometry(toplevel->xdg_toplevel->base, &geom);
+
+  // save the initial state of the window and cursor
+  toplevel->initial_geom.x = toplevel->scene_tree->node.x;
+  toplevel->initial_geom.y = toplevel->scene_tree->node.y;
+  toplevel->initial_geom.width = geom.width;
+  toplevel->initial_geom.height = geom.height;
+  server->grabbed_cursor_x = server->cursor->x;
+  server->grabbed_cursor_y = server->cursor->y;
+}
+
+
 // Move the grabbed toplevel
-static void handle_cursor_move(struct tinywl_server *server, uint32_t time) {
+static void handle_interactive_move(struct tinywl_server *server, uint32_t time) {
   struct tinywl_toplevel *toplevel = server->grabbed_toplevel;
   if (toplevel == NULL) {
     wlr_log(WLR_ERROR, "Trying to drag a NULL.");
@@ -311,7 +353,7 @@ static void handle_cursor_move(struct tinywl_server *server, uint32_t time) {
 
   if (wl_list_empty(&toplevel->link)) {
     wlr_log(WLR_INFO, "Grabbed window must have been destroyed mid-move.");
-    reset_cursor_mode(server);
+    end_interactive(server);
     return;
   }
 
@@ -335,7 +377,7 @@ static void handle_cursor_move(struct tinywl_server *server, uint32_t time) {
 }
 
 // Resize the grabbed toplevel at any corner or edge.
-static void handle_cursor_resize(struct tinywl_server *server, uint32_t time) {
+static void handle_interactive_resize(struct tinywl_server *server, uint32_t time) {
   struct tinywl_toplevel *toplevel = server->grabbed_toplevel;
 
   wlr_seat_pointer_notify_motion(server->seat, time, server->cursor->x, server->cursor->y);
@@ -347,7 +389,7 @@ static void handle_cursor_resize(struct tinywl_server *server, uint32_t time) {
   }
   if (wl_list_empty(&toplevel->link)) {
     wlr_log(WLR_DEBUG, "Grabbed window must have been destroyed mid-resize.");
-    reset_cursor_mode(server);
+    end_interactive(server);
     return;
   }
   if (!toplevel->scene_tree) {
@@ -386,26 +428,27 @@ static void handle_cursor_resize(struct tinywl_server *server, uint32_t time) {
   toplevel->pending_width = width;
   toplevel->pending_height = height;
   toplevel->resize_is_pending = true;
+
+  // I'm throttling client resize requests to the frame rate.
+  // This is a hack to make sure frames occasionally happen when running nested.
+  // It could be made more subtle in the case of multiple monitors.
+  struct tinywl_output *output;
+  wl_list_for_each(output, &server->outputs, link) {
+    wlr_output_schedule_frame(output->wlr_output);
+  }
 }
 
 static void handle_cursor_motion(struct tinywl_server *server, uint32_t time) {
-
-  // Always send coordinates to clients
-  wlr_seat_pointer_notify_motion(server->seat, time, server->cursor->x, server->cursor->y);
-
-  // Hack to force the clock to tick when running nested
-  struct tinywl_output *output;
-    wl_list_for_each(output, &server->outputs, link) {
-        wlr_output_schedule_frame(output->wlr_output);
-  }
-
   // If the mode is non-passthrough, delegate to those functions.
-  if (server->cursor_mode == TINYWL_CURSOR_MOVE) {
-    handle_cursor_move(server, time);
-    return;
-  } else if (server->cursor_mode == TINYWL_CURSOR_RESIZE) {
-    handle_cursor_resize(server, time);
-    return;
+  switch (server->cursor_mode) {
+    case TINYWL_CURSOR_MOVE:
+      handle_interactive_move(server, time);
+      return;
+    case TINYWL_CURSOR_RESIZE:
+      handle_interactive_resize(server, time);
+      return;
+    default:
+      break;
   }
 
   // Otherwise, find the toplevel under the pointer and send the event along.
@@ -540,7 +583,7 @@ static void update_drag_icon_position(struct tinywl_server *server) {
   wlr_scene_node_set_position(node, x, y);
 }
 
-// This function is triggered by a relative pointer motion event
+// Triggered by a relative pointer motion event
 static void server_cursor_motion(struct wl_listener *listener, void *data) {
   struct tinywl_server *server =
       wl_container_of(listener, server, cursor_motion);
@@ -552,7 +595,7 @@ static void server_cursor_motion(struct wl_listener *listener, void *data) {
   wlr_idle_notifier_v1_notify_activity(server->idle_notifier, server->seat);
 }
 
-// This function is triggered by an absolute pointer motion event
+// Triggered by an absolute pointer motion event,
 // eg. enter the window when tinywl is running nested in a window
 static void server_cursor_motion_absolute(struct wl_listener *listener,
                                           void *data) {
@@ -565,108 +608,139 @@ static void server_cursor_motion_absolute(struct wl_listener *listener,
   wlr_idle_notifier_v1_notify_activity(server->idle_notifier, server->seat);
 }
 
-// Set up an interactive move/resize, where the compositor grabs mouse events
-static void begin_interactive(struct tinywl_toplevel *toplevel,
-                              enum tinywl_cursor_mode mode, uint32_t edges) {
-  struct tinywl_server *server = toplevel->server;
-  struct wlr_surface *focused_surface =
-      server->seat->pointer_state.focused_surface;
-
-  // Sanity check
-  if (toplevel->xdg_toplevel->base->surface !=
-      wlr_surface_get_root_surface(focused_surface)) {
-    wlr_log(WLR_ERROR, "Trying to interact with a toplevel and unrelated surface");
-    return;
+static bool is_popup_at(struct tinywl_server *server, double lx, double ly) {
+  double sx, sy;
+  // Ask the scene graph what node is at the cursor coordinates 
+  struct wlr_scene_node *node =
+    wlr_scene_node_at(&server->scene->tree.node, lx, ly, &sx, &sy);
+    
+  if (node == NULL || node->type != WLR_SCENE_NODE_BUFFER) {
+    return false;
   }
 
-  // fullscreen
-  if (toplevel->is_fullscreen) {
-    return;
+  // Climb the scene tree to check if this buffer belongs to a popup 
+  struct wlr_scene_tree *tree = node->parent;
+  while (tree != NULL) {
+    if (tree->node.data != NULL) {
+      enum tinywl_surface_type *surface_type = tree->node.data;
+      if (*surface_type == TINYWL_SURFACE_POPUP) {
+        return true;
+      }
+      if (*surface_type == TINYWL_SURFACE_TOPLEVEL) {
+        return false;
+      }
+    }
+    tree = tree->node.parent;
   }
 
-  // Unmaximize. Maximized windows do not remember their previous size.
-  if (toplevel->is_maximized) {
-    wlr_xdg_toplevel_set_maximized(toplevel->xdg_toplevel, false);
-    toplevel->is_maximized = false;
-  }
-
-  server->grabbed_toplevel = toplevel;
-  server->cursor_mode = mode;
-  server->resize_edges = edges;
-
-  struct wlr_box geom;
-  wlr_xdg_surface_get_geometry(toplevel->xdg_toplevel->base, &geom);
-
-  // save the initial state of the window and cursor
-  toplevel->initial_geom.x = toplevel->scene_tree->node.x;
-  toplevel->initial_geom.y = toplevel->scene_tree->node.y;
-  toplevel->initial_geom.width = geom.width;
-  toplevel->initial_geom.height = geom.height;
-  server->grabbed_cursor_x = server->cursor->x;
-  server->grabbed_cursor_y = server->cursor->y;
-
-  toplevel->resize_is_pending = false;
+  return false;
 }
 
-// This function is triggered by a pointer button event
+    
+// Triggered by a mouse click or release
 static void server_cursor_button(struct wl_listener *listener, void *data) {
   struct tinywl_server *server = wl_container_of(listener, server, cursor_button);
   struct wlr_pointer_button_event *event = data;
-
-  // Button release while dragging or resizing a window
-  if (server->cursor_mode == TINYWL_CURSOR_MOVE ||
-      server->cursor_mode == TINYWL_CURSOR_RESIZE) {
-    if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
-      reset_cursor_mode(server);
-      return; // Do not notify wlroots or the client
-    }
-  }
-
-  // Get active keyboard hardware modifier flags
   uint32_t modifiers =
       wlr_keyboard_get_modifiers(wlr_seat_get_keyboard(server->seat));
-
-  // Get the surface and toplevel under the cursor
   double sx, sy;
   struct wlr_surface *surface = NULL;
   struct tinywl_toplevel *toplevel = desktop_toplevel_at(
       server, server->cursor->x, server->cursor->y, &surface, &sx, &sy);
 
-  // LOGO + Left Click (Interactive Window Move)
-  if ((modifiers & WLR_MODIFIER_LOGO) && (event->button == BTN_LEFT)) {
-    focus_toplevel(toplevel, surface);
-    begin_interactive(toplevel, TINYWL_CURSOR_MOVE, 0);
-    return; // Do not notify wlroots or the client
-  }
-
-  // LOGO + Right Click (Interactive Window Resize)
-  if ((modifiers & WLR_MODIFIER_LOGO) && (event->button == BTN_RIGHT)) {
-    focus_toplevel(toplevel, surface);
-    begin_interactive(toplevel, TINYWL_CURSOR_RESIZE,
-                      WLR_EDGE_BOTTOM | WLR_EDGE_RIGHT);
-    return; // Do not notify wlroots or the client
-  }
-
-  // click on empty space or not-LOGO click on a window
-  if (event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
-    if (toplevel == NULL) { // click on empty space
-      unfocus_toplevel(server);
-      wlr_seat_pointer_notify_button(server->seat, event->time_msec,
-                                     event->button, event->state);
-    } else {  // click on a surface
-      wlr_seat_pointer_notify_button(server->seat, event->time_msec,
-                                     event->button, event->state);
-      focus_toplevel(toplevel, surface);
+  // release the button that started a mod+click interaction
+  if ((event->state == WL_POINTER_BUTTON_STATE_PRESSED) && // redundant
+      (event->button == server->grabbed_active_button)) {
+    // note it must be button release
+    server->grabbed_active_button = 0;
+    if (server->cursor_mode != TINYWL_CURSOR_PASSTHROUGH) {
+      end_interactive(server);
     }
     return;
   }
+    
+  // release the button that canceled a mod+click interaction
+  if ((event->state == WL_POINTER_BUTTON_STATE_PRESSED) && // redundant
+      (event->button == server->grabbed_cancel_button)) {
+    server->grabbed_cancel_button = 0;
+    return;
+  }
 
-  // Remaining case: release event in the usual "passthrough" state
+  // a second press that cancels a mod+click interaction
+  // TO DO: maybe restore the pre-interaction geometry?
+  if ((event->state == WL_POINTER_BUTTON_STATE_PRESSED) &&
+      (server->cursor_mode != TINYWL_CURSOR_PASSTHROUGH)) {
+    server->grabbed_cancel_button = event->button;
+    end_interactive(server);
+    return;
+  }
+
+  // LOGO + Left Click (Interactive Window Move)
+  if ((event->state == WL_POINTER_BUTTON_STATE_PRESSED) &&
+      (modifiers & WLR_MODIFIER_LOGO) &&
+      (event->button == BTN_LEFT) && toplevel) {
+    server->grabbed_active_button = event->button;
+    focus_toplevel(toplevel, surface);
+    begin_interactive(toplevel, TINYWL_CURSOR_MOVE, 0);
+    return;
+  }
+
+  // LOGO + Right Click (Interactive Window Resize)
+  if ((event->state == WL_POINTER_BUTTON_STATE_PRESSED) &&
+      (modifiers & WLR_MODIFIER_LOGO) &&
+      (event->button == BTN_RIGHT) && toplevel) {
+    server->grabbed_active_button = event->button;
+    focus_toplevel(toplevel, surface);
+    begin_interactive(toplevel, TINYWL_CURSOR_RESIZE,
+                      WLR_EDGE_BOTTOM | WLR_EDGE_RIGHT);
+    return;
+  }
+
+  // NOTIFY THE SEAT IN EVERY REMAINING CASE
+
+  // Any release that was not grabbed
+  if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
+    end_interactive(server);
+    wlr_seat_pointer_notify_button(server->seat, event->time_msec,
+                                   event->button, event->state);
+    wlr_seat_pointer_notify_frame(server->seat);
+    return;
+  }
+
+  // button press on a popup - I think it must already have focus, so do nothing else
+  if (is_popup_at(server, server->cursor->x, server->cursor->y)) {
+    wlr_seat_pointer_notify_button(server->seat, event->time_msec,
+                                   event->button, event->state);
+    wlr_seat_pointer_notify_frame(server->seat);
+    return;
+  }
+
+  // It is a normal click that is not on a popup
+
+  // Dismiss all popups
+  struct tinywl_toplevel *top;
+  wl_list_for_each(top, &server->toplevels, link) {
+    struct wl_list *pops = &top->xdg_toplevel->base->popups;
+    while (!wl_list_empty(pops)) {
+      struct wlr_xdg_popup *pop =
+          wl_container_of(pops->next, pop, link);
+      wlr_xdg_popup_destroy(pop);
+    }
+    wlr_log(WLR_DEBUG, "Popups dismissed.");
+  }
+
+  // Set keyboard focus
+  if (toplevel == NULL) {
+    unfocus_toplevel(server);
+  } else {
+    focus_toplevel(toplevel, surface);
+  }
+
+  // Notify
   wlr_seat_pointer_notify_button(server->seat, event->time_msec,
                                  event->button, event->state);
+  wlr_seat_pointer_notify_frame(server->seat);
 } 
-    
-
 
 // Function triggered by a pointer axis event, eg. scroll wheel.
 static void server_cursor_axis(struct wl_listener *listener, void *data) {
@@ -816,7 +890,7 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 
   // Clear cursor grab if this window was being manipulated
   if (toplevel == server->grabbed_toplevel) {
-    reset_cursor_mode(server);
+    end_interactive(server);
   }
 
   // Check if this unmapping window currently has keyboard focus
@@ -997,7 +1071,7 @@ static void xdg_toplevel_request_maximize(struct wl_listener *listener, void *da
                             output->width, output->height);
 }
 
-// This function is called every time the client updates its surface buffer.
+// Called every time the client updates its surface buffer.
 // Adjust the boundaries of the scene graph node so the frame can be drawn.
 static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
   struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, commit);
@@ -1128,7 +1202,6 @@ static void handle_new_popup(struct tinywl_server *server, struct wlr_xdg_popup 
   wl_signal_add(&xdg_popup->base->events.destroy, &popup->destroy);
 }
 
-
 // For wlr_xdg_decoration_manager_v1
 static void handle_new_toplevel_decoration(struct wl_listener *listener, void *data) {
   struct wlr_xdg_toplevel_decoration_v1 *decoration = data;
@@ -1136,7 +1209,6 @@ static void handle_new_toplevel_decoration(struct wl_listener *listener, void *d
   wlr_xdg_toplevel_decoration_v1_set_mode(decoration, 
         WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
 }
-
 
 // Event raised when client sends a new xdg surface to wlr_xdg_shell
 static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
@@ -1348,7 +1420,7 @@ static void cycle_toplevels(struct tinywl_server *server) {
   focus_toplevel(front, front->xdg_toplevel->base->surface);
 }
 
-// This function assumes LOGO is held down and a key is pressed
+// Assume LOGO is held down and handle another key pressed.
 static bool handle_quick_key(struct tinywl_server *server, uint32_t sym) {
   switch (sym) {
     case XKB_KEY_Return:
@@ -1415,7 +1487,8 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
   // See if the compositor should grab and act on a keypress 
   if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED &&
       keyboard->grabbed_keycode == 0) {
-    uint32_t sym = xkb_state_key_get_one_sym(keyboard->wlr_keyboard->xkb_state, event->keycode + 8);
+    uint32_t sym = xkb_state_key_get_one_sym(keyboard->wlr_keyboard->xkb_state,
+                                             event->keycode + 8);
     uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
     if (handle_media_key(sym)) {
       grab = true;
