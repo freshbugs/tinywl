@@ -55,7 +55,6 @@
 #include <wlr/types/wlr_layer_shell_v1.h>
 #include "wlr-layer-shell-unstable-v1-protocol.h"
 
-/* For brevity's sake, struct members are annotated where they are used. */
 enum tinywl_cursor_mode {
   TINYWL_CURSOR_PASSTHROUGH,
   TINYWL_CURSOR_MOVE,
@@ -76,6 +75,12 @@ struct tinywl_server {
   struct wlr_xdg_shell *xdg_shell;
   struct wl_listener new_xdg_surface;
   struct wl_list toplevels;
+
+  // Analogous to toplevels, for wlr_layer_shell_unstable_v1
+  struct wl_list background_layers;
+  struct wl_list bottom_layers;
+  struct wl_list top_layers;
+  struct wl_list overlay_layers;
 
   struct wlr_cursor *cursor;
   struct wlr_xcursor_manager *cursor_manager;
@@ -100,6 +105,14 @@ struct tinywl_server {
 
   struct wlr_allocator *allocator;
   struct wlr_scene *scene;
+
+  // To be attached to scene, for wlr_layer_shell_unstable_v1
+  struct wlr_scene_tree *scene_background;
+  struct wlr_scene_tree *scene_bottom;
+  struct wlr_scene_tree *scene_normal;
+  struct wlr_scene_tree *scene_top;
+  struct wlr_scene_tree *scene_overlay;
+
   struct wlr_scene_output_layout *scene_layout;
 
   // for DnD
@@ -210,7 +223,8 @@ struct tinywl_layer_surface {
   struct wl_listener map;
   struct wl_listener unmap;
   struct wl_listener destroy;
-  struct wl_listener surface_commit;
+  struct wl_listener commit;
+  struct wl_listener new_popup;
 };
 
 
@@ -228,64 +242,253 @@ static void spawn(const char *cmd) {
   }
 }
 
-// For wlr_layer_shell_unstable_v1
-static void handle_layer_map(struct wl_listener *listener, void *data) {
+// Helper function to get the right layer list from an enum
+struct wl_list *get_layer_list(struct tinywl_server *server,
+                               struct wlr_layer_surface_v1 *wlr_layer) {
+  switch (wlr_layer->current.layer) {
+    case ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND:
+      return &server->background_layers;
+    case ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM:
+      return &server->bottom_layers;
+    case ZWLR_LAYER_SHELL_V1_LAYER_TOP:
+      return &server->top_layers;
+    case ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY:
+      return &server->overlay_layers;
+    default:
+      wlr_log(WLR_DEBUG, "Unknown layer set to top.");
+      return &server->top_layers;
+  }
 }
 
+// Helper function to get the right
+
+// For wlr_layer_shell_unstable_v1
+static void arrange_layers(struct tinywl_server *server) {
+  if (wl_list_empty(&server->outputs)) {
+    wlr_log(WLR_DEBUG, "No active monitors, so don't arrange layers.");
+    return;
+  }
+    
+  // Get screen dimensions
+  struct wlr_box full_area;
+  wlr_output_layout_get_box(server->output_layout, NULL, &full_area);
+
+  // Loop over all managed layers
+  struct tinywl_layer_surface *layer_surface;
+  wl_list_for_each(layer_surface, &server->layer_surfaces, link) {
+    struct wlr_layer_surface_v1 *wlr_layer_surface =
+        layer_surface->wlr_layer_surface;
+    struct wlr_layer_surface_v1_state *state = &wlr_layer_surface->pending;
+     
+    // Use requested dimensions
+    uint32_t width = state->desired_width;
+    uint32_t height = state->desired_height;
+    
+    // Stretch width if requested to anchor to both Left and Right edges
+    if ((state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT) && 
+        (state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT)) {
+      width = full_area.width - state->margin.left - state->margin.right;
+    }
+
+    // Stretch height if requested to anchor to both Top and Bottom edges
+    if ((state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP) && 
+        (state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM)) {
+      height = full_area.height - state->margin.top - state->margin.bottom;
+    }
+        
+    // Send the handshake confirmation back to the client
+    wlr_layer_surface_v1_configure(wlr_layer_surface, width, height);
+  }
+}
+
+// For wlr_layer_shell_unstable_v1 
+// Called once when a layer surface becomes visible
+static void handle_layer_map(struct wl_listener *listener, void *data) {
+  struct tinywl_layer_surface *surface =
+      wl_container_of(listener, surface, map);
+  struct tinywl_server *server = surface->server;
+
+  // Insert the surface into its specific tracking list (e.g., top_layers)
+  struct wl_list *target_list =
+      get_layer_list(server, surface->wlr_layer_surface);
+  wl_list_insert(target_list, &surface->link);
+
+  // Trigger the layout configuration handshake
+  arrange_layers(server);
+}
+
+
+// Unmap, for wlr_layer_shell_unstable_v1
 static void handle_layer_unmap(struct wl_listener *listener, void *data) {
-  /* Empty for now */
+  // Extract your custom wrapper structure
+  struct tinywl_layer_surface *surface =
+      wl_container_of(listener, surface, unmap);
+  struct tinywl_server *server = surface->server;
+
+  // Remove from the active rendering list and re-initialize the link
+  wl_list_remove(&surface->link);
+  wl_list_init(&surface->link);
+
+  // TODO: Focus cleanup if this layer currently has keyboard focus
+  // TODO: Exclusive zone recalculations (freeing up usable screen space)
+
+  // Re-arrange the layers that are still there
+  arrange_layers(server);
 }
 
 // For wlr_layer_shell_unstable_v1
 static void handle_layer_destroy(struct wl_listener *listener, void *data) {
-  struct tinywl_layer_surface *layer_surface = 
-      wl_container_of(listener, layer_surface, destroy);
+  struct tinywl_layer_surface *surface = 
+      wl_container_of(listener, surface, destroy);
 
-  wl_list_remove(&layer_surface->link);
-  wl_list_remove(&layer_surface->map.link);
-  wl_list_remove(&layer_surface->unmap.link);
-  wl_list_remove(&layer_surface->destroy.link);
-  free(layer_surface);
+  if (surface->wlr_layer_surface->surface->mapped) {
+    handle_layer_unmap(&surface->unmap, NULL);
+  }
+
+  wl_list_remove(&surface->map.link);
+  wl_list_remove(&surface->unmap.link);
+  wl_list_remove(&surface->destroy.link);
+
+  arrange_layers(surface->server);
+  free(surface);
+}
+
+// For wlr_layer_shell_unstable_v1
+static void handle_layer_commit(struct wl_listener *listener, void *data) {
+  struct tinywl_layer_surface *surface =
+      wl_container_of(listener, surface, commit);
+  struct wlr_layer_surface_v1 *wlr_layer_surface = surface->wlr_layer_surface;
+
+  // Skip if the surface isn't ready
+  if (!wlr_layer_surface->initialized) {
+    return;
+  }
+
+  // --- KEYBOARD FOCUS ROUTING ---
+  // Check if the client application is actively requesting keyboard focus
+  struct wlr_layer_surface_v1_state *state = &wlr_layer_surface->current;
+  
+  if (state->keyboard_interactive && wlr_layer_surface->surface->mapped) {
+      struct tinywl_server *server = surface->server;
+      
+      // Violently redirect keyboard focus to this specific layer surface
+      wlr_seat_keyboard_notify_enter(
+          server->seat, 
+          wlr_layer_surface->surface, 
+          NULL, 0, NULL
+      );
+  }
+
+  // Read what changed between the last frame and this frame
+  // wlroots provides a bitmask of what changed.
+  // I think caps is short for capabilities or captures.
+  uint32_t caps = wlr_layer_surface->current.committed;
+
+  // Only rearrange if layout critical properties changed
+  if (caps & (WLR_LAYER_SURFACE_V1_STATE_ANCHOR |
+              WLR_LAYER_SURFACE_V1_STATE_EXCLUSIVE_ZONE |
+              WLR_LAYER_SURFACE_V1_STATE_MARGIN |
+              WLR_LAYER_SURFACE_V1_STATE_DESIRED_SIZE)) {
+    arrange_layers(surface->server);
+  }
+}
+
+// popups for wlr_layer_shell_unstable_v1
+static void handle_layer_new_popup(struct wl_listener *listener, void *data) {
+  struct tinywl_layer_surface *layer_surface =
+      wl_container_of(listener, layer_surface, new_popup);
+  struct wlr_xdg_popup *popup = data;
+  // Attach the popup to the status bar's own visual scene graph folder tree
+  struct wlr_scene_tree *popup_tree = wlr_scene_xdg_surface_create(
+      layer_surface->scene_layer_surface->tree, popup->base);
+  // Save the scene tree pointer inside the popup surface data 
+  popup->base->surface->data = popup_tree;
 }
 
 // For wlr_layer_shell_unstable_v1
 static void server_new_layer_surface(struct wl_listener *listener, void *data) {
-  struct tinywl_server *server = wl_container_of(listener, server, new_layer_surface);
+  struct tinywl_server *server =
+      wl_container_of(listener, server, new_layer_surface);
   struct wlr_layer_surface_v1 *wlr_layer_surface = data;
 
-  struct tinywl_layer_surface *layer_surface = calloc(1, sizeof(*layer_surface));
-  if (layer_surface == NULL) {
+  struct tinywl_layer_surface *surface = calloc(1, sizeof(*surface));
+  if (surface == NULL) {
     wlr_log(WLR_ERROR, "Failed to create a layer surface.");
     return;
   }
-  layer_surface->server = server;
-  layer_surface->wlr_layer_surface = wlr_layer_surface;
+  surface->server = server;
+  surface->wlr_layer_surface = wlr_layer_surface;
 
-  // Create the scene layer surface and attach it to the parent tree
-  layer_surface->scene_layer_surface =
-      wlr_scene_layer_surface_v1_create(&server->scene->tree, wlr_layer_surface);
-      
-  if (layer_surface->scene_layer_surface == NULL) {
-    wlr_log(WLR_ERROR, "Failed to create scene tree for layer surface.");
-    free(layer_surface);
-    return;
+  // Select the parent tree based on what the application requested
+  struct wlr_scene_tree *parent_tree;
+  switch (wlr_layer_surface->pending.layer) {
+    case ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND:
+        parent_tree = server->scene_background;
+        break;
+    case ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM:
+        parent_tree = server->scene_bottom;
+        break;
+    case ZWLR_LAYER_SHELL_V1_LAYER_TOP:
+        parent_tree = server->scene_top;
+        break;
+    case ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY:
+        parent_tree = server->scene_overlay;
+        break;
+    default:
+        parent_tree = server->scene_top;
   }
 
-  // Create the scene graph and attach it to the  root scene container
-  layer_surface->scene_layer_surface->tree->node.data = layer_surface;
-  wlr_layer_surface->data = layer_surface;
+  // Attach the layer surface
+  surface->scene_layer_surface =
+      wlr_scene_layer_surface_v1_create(parent_tree, wlr_layer_surface);
+      
+  // Create the scene graph and attach it to the root scene container
+  surface->scene_layer_surface->tree->node.data = surface;
+  wlr_layer_surface->data = surface;
+
+  // Give it permission to get cursor or keyboard focus
+  wlr_scene_node_set_enabled(&surface->scene_layer_surface->tree->node, true); 
 
   // Listen for lifecycle events 
-  layer_surface->map.notify = handle_layer_map;
-  wl_signal_add(&wlr_layer_surface->surface->events.map, &layer_surface->map);
+  surface->map.notify = handle_layer_map;
+  wl_signal_add(&wlr_layer_surface->surface->events.map, &surface->map);
 
-  layer_surface->unmap.notify = handle_layer_unmap;
-  wl_signal_add(&wlr_layer_surface->surface->events.unmap, &layer_surface->unmap);
+  surface->unmap.notify = handle_layer_unmap;
+  wl_signal_add(&wlr_layer_surface->surface->events.unmap, &surface->unmap);
 
-  layer_surface->destroy.notify = handle_layer_destroy;
-  wl_signal_add(&wlr_layer_surface->events.destroy, &layer_surface->destroy);
+  surface->destroy.notify = handle_layer_destroy;
+  wl_signal_add(&wlr_layer_surface->events.destroy, &surface->destroy);
 
-  wl_list_insert(&server->layer_surfaces, &layer_surface->link);
+  surface->new_popup.notify = handle_layer_new_popup;
+  wl_signal_add(&wlr_layer_surface->events.new_popup, &surface->new_popup);
+
+  surface->commit.notify = handle_layer_commit;
+  wl_signal_add(&wlr_layer_surface->surface->events.commit, &surface->commit);
+
+  // ==========================================
+  // LOGGING THE INITIAL HANDSHAKE CONFIGURATION
+  // ==========================================
+
+  // I added this logging to figure out why layers were giving an Error 71.
+  // It fixed the problem! (I think it's called a heisenbug).
+  // TODO: find a better fix.
+  struct wlr_layer_surface_v1_state *state = &wlr_layer_surface->pending;
+  
+  wlr_log(WLR_DEBUG, "[Layer Shell] New Surface Created (%p). App Requested: width=%d, height=%d, layer=%d",
+          (void *)wlr_layer_surface, state->desired_width, state->desired_height, state->layer);
+
+  // Send whatever the current state is right now
+  uint32_t initial_w = state->desired_width;
+  uint32_t initial_height = state->desired_height;
+
+  wlr_log(WLR_DEBUG, "[Layer Shell] Sending FIRST Handshake Configure to %p: width=%d, height=%d",
+          (void *)wlr_layer_surface, initial_w, initial_height);
+
+  wlr_layer_surface_v1_configure(wlr_layer_surface, initial_w, initial_height);
+  
+  // END LOGGING
+  // Call your arranger
+  arrange_layers(server);
 }
 
 // For wlr_idle_notifier_v1
@@ -426,7 +629,6 @@ static void begin_interactive(struct tinywl_toplevel *toplevel,
   server->grabbed_cursor_y = server->cursor->y;
 }
 
-
 // Move the grabbed toplevel
 static void handle_interactive_move(struct tinywl_server *server, uint32_t time) {
   struct tinywl_toplevel *toplevel = server->grabbed_toplevel;
@@ -541,12 +743,14 @@ static void handle_cursor_motion(struct tinywl_server *server, uint32_t time) {
   struct wlr_surface *surface = NULL;
 
   // Use the scene graph root directly to see absolutely everything rendered
-  struct wlr_scene_node *node = wlr_scene_node_at(
-      &server->scene->tree.node, server->cursor->x, server->cursor->y, &sx, &sy);
+  struct wlr_scene_node *node =
+      wlr_scene_node_at(&server->scene->tree.node, server->cursor->x,
+                        server->cursor->y, &sx, &sy);
 
   if (node && node->type == WLR_SCENE_NODE_BUFFER) {
     struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
-    struct wlr_scene_surface *scene_surface = wlr_scene_surface_try_from_buffer(scene_buffer);
+    struct wlr_scene_surface *scene_surface =
+        wlr_scene_surface_try_from_buffer(scene_buffer);
     
     if (scene_surface) {
       surface = scene_surface->surface;
@@ -564,7 +768,6 @@ static void handle_cursor_motion(struct tinywl_server *server, uint32_t time) {
     wlr_seat_pointer_notify_motion(seat, time, sx, sy);
   }
 }
-
 
 // Unfocus
 static void unfocus_toplevel(struct tinywl_server *server) {
@@ -923,31 +1126,29 @@ static void server_new_output(struct wl_listener *listener, void *data) {
     wlr_output_state_set_mode(&state, mode);
   }
 
-  /* Automically applies the new output state. */
+  // Automically applies the new output state. 
   wlr_output_commit_state(wlr_output, &state);
   wlr_output_state_finish(&state);
 
-  /* Allocates and configures our state for this output */
+  // Allocates and configures our state for this output.
   struct tinywl_output *output = calloc(1, sizeof(*output));
   output->wlr_output = wlr_output;
   output->server = server;
 
-  /* Sets up a listener for the frame event. */
+  // Set up listeners.
   output->frame.notify = output_frame;
   wl_signal_add(&wlr_output->events.frame, &output->frame);
 
-  /* Sets up a listener for the state request event. */
   output->request_state.notify = output_request_state;
   wl_signal_add(&wlr_output->events.request_state, &output->request_state);
 
-  /* Sets up a listener for the destroy event. */
   output->destroy.notify = output_destroy;
   wl_signal_add(&wlr_output->events.destroy, &output->destroy);
 
   wl_list_insert(&server->outputs, &output->link);
 
-  // Adds this to the output layout.
-  // Simple, so use the default: arrange outputs left to right.
+  // Add this to the output layout.
+  // Keep the simple default: arrange outputs left to right.
   struct wlr_output_layout_output *l_output =
       wlr_output_layout_add_auto(server->output_layout, wlr_output);
   struct wlr_scene_output *scene_output =
@@ -955,7 +1156,7 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 
   // Background color
   float background_color[4] = {0.02f, 0.20f, 0.20f, 1.0f};
-  wlr_scene_rect_create(&server->scene->tree, 
+  wlr_scene_rect_create(server->scene_background,
                         wlr_output->width, 
                         wlr_output->height, 
                         background_color);
@@ -969,17 +1170,27 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
   struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, map);
   struct tinywl_server *server = toplevel->server;
 
-  // Intercept placement due to a finished drag, added for DnD and tearoff tabs
+  // Position the window
   if (server->drag_just_ended) {
+    // Intercept placement after drag, added for DnD and tearoff tabs
     server->drag_just_ended = false;
     int spawn_x = (int)server->cursor->x;
     int spawn_y = (int)server->cursor->y;
     wlr_scene_node_set_position(&toplevel->scene_tree->node, spawn_x, spawn_y);
+  } else {
+    wlr_scene_node_set_position(&toplevel->scene_tree->node, 50, 50);
   }
 
+  // Track the window state
   wl_list_insert(&toplevel->server->toplevels, &toplevel->link);
+  
+  // Explicitly enable this specific window's visual node.
+  wlr_scene_node_set_enabled(&toplevel->scene_tree->node, true);
+
+  // Focus the window
   focus_toplevel(toplevel, toplevel->xdg_toplevel->base->surface);
 }
+
 
 // Function called when the surface is unmapped (visually hidden/closed).
 static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
@@ -1205,18 +1416,94 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
   }
 }
 
-static void handle_new_toplevel(struct tinywl_server *server,
-                                struct wlr_xdg_surface *xdg_surface) {
+
+static void popup_handle_commit(struct wl_listener *listener, void *data) {
+    // In wlroots 0.17, committing a popup surface requires scheduling a repaint
+    struct tinywl_popup *popup = wl_container_of(listener, popup, commit);
+    wlr_log(WLR_DEBUG, "popup handle commit.");
+    
+    if (popup->xdg_popup->base->initial_commit) {
+        // First commit, nothing to damage yet
+        return;
+    }
+    
+    // Optional: If you implemented scene-graph or manual tracking, 
+    // you would trigger a frame damage event here. 
+    // For raw tinywl, the output frame loop handles general rendering.
+}
+
+static void popup_handle_destroy(struct wl_listener *listener, void *data) {
+  wlr_log(WLR_DEBUG, "popup handle destroy.");
+  struct tinywl_popup *popup = wl_container_of(listener, popup, destroy);
+
+  wl_list_remove(&popup->commit.link);
+  wl_list_remove(&popup->destroy.link);
+  
+  free(popup);
+}
+
+// For wlr_xdg_decoration_manager_v1
+static void handle_new_toplevel_decoration(struct wl_listener *listener, void *data) {
+  struct wlr_xdg_toplevel_decoration_v1 *decoration = data;
+  // Tell the client to draw its own window decorations
+  wlr_xdg_toplevel_decoration_v1_set_mode(decoration, 
+        WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
+}
+
+// Event raised when client sends a new xdg surface to wlr_xdg_shell
+static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
+  struct tinywl_server *server =
+      wl_container_of(listener, server, new_xdg_surface);
+  struct wlr_xdg_surface *xdg_surface = data;
+
+  if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_POPUP) {
+
+    // Find the popup's parent
+    struct wlr_surface *parent = xdg_surface->popup->parent;
+    if (parent == NULL) {
+      wlr_log(WLR_ERROR, "orphan popup.");
+      return;
+    }
+
+    // Find the parent's scene node
+    struct wlr_scene_tree *parent_tree = parent->data;
+    if (parent_tree == NULL) {
+      wlr_log(WLR_ERROR, "popup parent has no scene.");
+      return;
+    }
+
+    // Attach the popup to the parent's scene tree.
+    struct wlr_scene_tree *popup_tree = 
+        wlr_scene_xdg_surface_create(parent_tree, xdg_surface);
+    
+    // Save this scene node pointer for future sub-popups to see.
+    xdg_surface->surface->data = popup_tree;
+
+    return;
+  }
+
+  // It's a regular toplevel, not a popup.
+
   struct tinywl_toplevel *toplevel = calloc(1, sizeof(*toplevel));
+  if (toplevel == NULL) {
+    wlr_log(WLR_ERROR, "Failed to create a toplevel.");
+    return;
+  }
+
   toplevel->server = server;
   toplevel->xdg_toplevel = xdg_surface->toplevel;
   toplevel->type = TINYWL_SURFACE_TOPLEVEL;
 
   // Attach to the scene graph
-  toplevel->scene_tree = wlr_scene_xdg_surface_create(&server->scene->tree,
-                                                       xdg_surface);
+  toplevel->scene_tree =
+      wlr_scene_xdg_surface_create(server->scene_normal, xdg_surface);
+  if (toplevel->scene_tree == NULL) {
+    wlr_log(WLR_ERROR, "Failed to create a toplevel scene tree.");
+    free(toplevel);
+    return;
+  }
   toplevel->scene_tree->node.data = toplevel;
-  xdg_surface->data = toplevel->scene_tree;
+  xdg_surface->surface->data = toplevel->scene_tree;
 
   // Set up listeners
   // Core Surface Layer Events (map, unmap, commit)
@@ -1246,82 +1533,7 @@ static void handle_new_toplevel(struct tinywl_server *server,
   toplevel->request_fullscreen.notify = xdg_toplevel_request_fullscreen;
   wl_signal_add(&xdg_surface->toplevel->events.request_fullscreen, &toplevel->request_fullscreen);
 }
-
-static void popup_handle_commit(struct wl_listener *listener, void *data) {
-    // In wlroots 0.17, committing a popup surface requires scheduling a repaint
-    struct tinywl_popup *popup = wl_container_of(listener, popup, commit);
-    wlr_log(WLR_DEBUG, "popup handle commit.");
-    
-    if (popup->xdg_popup->base->initial_commit) {
-        // First commit, nothing to damage yet
-        return;
-    }
-    
-    // Optional: If you implemented scene-graph or manual tracking, 
-    // you would trigger a frame damage event here. 
-    // For raw tinywl, the output frame loop handles general rendering.
-}
-
-static void popup_handle_destroy(struct wl_listener *listener, void *data) {
-  wlr_log(WLR_DEBUG, "popup handle destroy.");
-  struct tinywl_popup *popup = wl_container_of(listener, popup, destroy);
-
-  wl_list_remove(&popup->commit.link);
-  wl_list_remove(&popup->destroy.link);
   
-  free(popup);
-}
-
-
-static void handle_new_popup(struct tinywl_server *server, struct wlr_xdg_popup *xdg_popup) {
-  wlr_log(WLR_DEBUG, "popup handle destroy.");
-  struct tinywl_popup *popup = calloc(1, sizeof(struct tinywl_popup));
-  popup->type = TINYWL_SURFACE_POPUP;
-  if (!popup) {
-    return;
-  }
-
-  popup->xdg_popup = xdg_popup;
-
-  // Attach to the scene graph tree. wlroots 0.17 handles nested submenus 
-  // automatically if we pass the primary scene tree root.
-  popup->scene_tree = wlr_scene_xdg_surface_create(&server->scene->tree, xdg_popup->base);
-  if (!popup->scene_tree) {
-    free(popup);
-    return;
-  }
-
-  popup->scene_tree->node.data = popup;
-
-  popup->commit.notify = popup_handle_commit;
-  wl_signal_add(&xdg_popup->base->surface->events.commit, &popup->commit);
-
-  popup->destroy.notify = popup_handle_destroy;
-  wl_signal_add(&xdg_popup->base->events.destroy, &popup->destroy);
-}
-
-// For wlr_xdg_decoration_manager_v1
-static void handle_new_toplevel_decoration(struct wl_listener *listener, void *data) {
-  struct wlr_xdg_toplevel_decoration_v1 *decoration = data;
-  // Tell the client to draw its own window decorations
-  wlr_xdg_toplevel_decoration_v1_set_mode(decoration, 
-        WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
-}
-
-// Event raised when client sends a new xdg surface to wlr_xdg_shell
-static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
-  struct tinywl_server *server = wl_container_of(listener, server, new_xdg_surface);
-  struct wlr_xdg_surface *xdg_surface = data;
-
-  if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
-    handle_new_toplevel(server, xdg_surface); 
-  } else if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_POPUP) {
-    handle_new_popup(server, xdg_surface->popup);
-  } else {
-    wlr_log(WLR_ERROR, "new surface with no ROLE.");
-  }
-}
-
 // For xdg-activation-v1.xml - when you click on a link to open a browser
 static void server_request_activation(struct wl_listener *listener, void *data) {
   struct tinywl_server *server = 
@@ -1741,11 +1953,11 @@ static void server_new_input(struct wl_listener *listener, void *data) {
   wlr_seat_set_capabilities(server->seat, caps);
 }
 
-
 int main(int argc, char *argv[]) {
   wlr_log_init(WLR_DEBUG, NULL);
-  char *startup_cmd = NULL;
 
+  // Command line argument parser
+  char *startup_cmd = NULL;
   int c;
   while ((c = getopt(argc, argv, "s:h")) != -1) {
     switch (c) {
@@ -1762,17 +1974,21 @@ int main(int argc, char *argv[]) {
     return 0;
   }
 
+  // Initialize server
   struct tinywl_server server = {0};
-  server.wl_display = wl_display_create();
 
-  // Choose the most suitable backend based on the current environment
+  server.wl_display = wl_display_create();
+  if (!server.wl_display) {
+    wlr_log(WLR_ERROR, "Failed to create Wayland display");
+    return 1;
+  }
+
   server.backend = wlr_backend_autocreate(server.wl_display, &server.session);
   if (server.backend == NULL) {
     wlr_log(WLR_ERROR, "Failed to create wlr_backend");
     return 1;
   }
 
-  // Create a renderer
   server.renderer = wlr_renderer_autocreate(server.backend);
   if (server.renderer == NULL) {
     wlr_log(WLR_ERROR, "Failed to create wlr_renderer");
@@ -1780,14 +1996,14 @@ int main(int argc, char *argv[]) {
   }
   wlr_renderer_init_wl_display(server.renderer, server.wl_display);
 
-  // Create an allocator - the bridge between renderer and backend
   server.allocator = wlr_allocator_autocreate(server.backend, server.renderer);
   if (server.allocator == NULL) {
     wlr_log(WLR_ERROR, "Failed to create wlr_allocator");
     return 1;
   }
 
-  // Instantiate the data device manager for copy/paste and DnD
+  // Data Device Manager Protocol
+  // for copy/paste and DnD
   struct wlr_data_device_manager *data_device_manager =
       wlr_data_device_manager_create(server.wl_display);
   if (data_device_manager == NULL) {
@@ -1795,78 +2011,51 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  /* This creates some hands-off wlroots interfaces. The compositor is
-   * necessary for clients to allocate surfaces, the subcompositor allows to
-   * assign the role of subsurfaces to surfaces and the data device manager
-   * handles the clipboard. Each of these wlroots interfaces has room for you
-   * to dig your fingers in and play with their behavior if you want. Note that
-   * the clients cannot set the selection directly without compositor approval,
-   * see the handling of the request_set_selection event below.*/
+  // wlroots interface for clients to allocate surfaces.
   wlr_compositor_create(server.wl_display, 5, server.renderer);
+
+  // wlroots interface for subsurfaces
   wlr_subcompositor_create(server.wl_display);
 
-  /* Creates an output layout, which a wlroots utility for working with an
-   * arrangement of screens in a physical layout. */
+  // wlroots utility to arrange monitor screens
   server.output_layout = wlr_output_layout_create();
-
-  /* Configure a listener to be notified when new outputs are available on the
-   * backend. */
   wl_list_init(&server.outputs);
   server.new_output.notify = server_new_output;
   wl_signal_add(&server.backend->events.new_output, &server.new_output);
 
-  /* Create a scene graph. This is a wlroots abstraction that handles all
-   * rendering and damage tracking. All the compositor author needs to do
-   * is add things that should be rendered to the scene graph at the proper
-   * positions and then call wlr_scene_output_commit() to render a frame if
-   * necessary.
-   */
+  // Create a scene graph.
+  // wlr_scene_output_commit() uses this to render a frame.
   server.scene = wlr_scene_create();
-  server.scene_layout =
-      wlr_scene_attach_output_layout(server.scene, server.output_layout);
+  if (server.scene ==  NULL) {
+    wlr_log(WLR_ERROR, "Failed to create scene graph");
+    return 1;
+  }
 
-  // For wlr-screencopy-unstable-v1
-  wlr_screencopy_manager_v1_create(server.wl_display);
+  // Create stacked Z-index buckets, for wlr_layer_shell_unstable_v1
+  server.scene_background = wlr_scene_tree_create(&server.scene->tree);
+  server.scene_bottom     = wlr_scene_tree_create(&server.scene->tree);
+  server.scene_normal     = wlr_scene_tree_create(&server.scene->tree);
+  server.scene_top        = wlr_scene_tree_create(&server.scene->tree);
+  server.scene_overlay    = wlr_scene_tree_create(&server.scene->tree);
 
-  // For zxdg_output_manager_v1
-  wlr_xdg_output_manager_v1_create(server.wl_display, server.output_layout);
+  // Activate
+  wlr_scene_node_set_enabled(&server.scene_background->node, true);
+  wlr_scene_node_set_enabled(&server.scene_bottom->node, true);
+  wlr_scene_node_set_enabled(&server.scene_normal->node, true);
+  wlr_scene_node_set_enabled(&server.scene_top->node, true);
+  wlr_scene_node_set_enabled(&server.scene_overlay->node, true);
 
-  // For xdg-shell version 3.
+  // Initialize tracking lists
+  wl_list_init(&server.background_layers);
+  wl_list_init(&server.bottom_layers);
   wl_list_init(&server.toplevels);
-  server.xdg_shell = wlr_xdg_shell_create(server.wl_display, 3);
-  server.new_xdg_surface.notify = server_new_xdg_surface;
-  wl_signal_add(&server.xdg_shell->events.new_surface, &server.new_xdg_surface);
+  wl_list_init(&server.top_layers);
+  wl_list_init(&server.overlay_layers);
 
-  // For wlr_layer_shell_unstable_v1
-  wl_list_init(&server.layer_surfaces);
-  server.layer_shell = wlr_layer_shell_v1_create(server.wl_display, 4);
-  server.new_layer_surface.notify = server_new_layer_surface;
-  wl_signal_add(&server.layer_shell->events.new_surface, &server.new_layer_surface);
-
-
-  /*
-   * Creates a cursor, which is a wlroots utility for tracking the cursor
-   * image shown on screen.
-   */
+  // Configure the cursor
   server.cursor = wlr_cursor_create();
   wlr_cursor_attach_output_layout(server.cursor, server.output_layout);
-
-  /* Creates an xcursor manager, another wlroots utility which loads up
-   * Xcursor themes to source cursor images from and makes sure that cursor
-   * images are available at all scale factors on the screen (necessary for
-   * HiDPI support). */
   server.cursor_manager = wlr_xcursor_manager_create(NULL, 24);
-
-  /*
-   * wlr_cursor *only* displays an image on screen. It does not move around
-   * when the pointer moves. However, we can attach input devices to it, and
-   * it will generate aggregate events for all of them. In these events, we
-   * can choose how we want to process them, forwarding them to clients and
-   * moving the cursor around. More detail on this process is described in
-   * https://drewdevault.com/2018/07/17/Input-handling-in-wlroots.html.
-   *
-   * And more comments are sprinkled throughout the notify functions above.
-   */
   server.cursor_mode = TINYWL_CURSOR_PASSTHROUGH;
   server.cursor_motion.notify = server_cursor_motion;
   wl_signal_add(&server.cursor->events.motion, &server.cursor_motion);
@@ -1880,27 +2069,19 @@ int main(int argc, char *argv[]) {
   server.cursor_frame.notify = server_cursor_frame;
   wl_signal_add(&server.cursor->events.frame, &server.cursor_frame);
 
-  // For wlr_xdg_decoration_manager_v1
-  server.xdg_decoration_manager = wlr_xdg_decoration_manager_v1_create(server.wl_display);
-  server.new_toplevel_decoration.notify = handle_new_toplevel_decoration;
-  wl_signal_add(&server.xdg_decoration_manager->events.new_toplevel_decoration, 
-                &server.new_toplevel_decoration);
-
-  // For wlr_idle_notifier_v1
-  server.idle_notifier = wlr_idle_notifier_v1_create(server.wl_display);
-
-  /*
-   * Configures a seat, which is a single "seat" at which a user sits and
-   * operates the computer. This conceptually includes up to one keyboard,
-   * pointer, touch, and drawing tablet device. We also rig up a listener to
-   * let us know when new input devices are available on the backend.
-   */
+  // Configure the seat
   wl_list_init(&server.keyboards);
   server.new_input.notify = server_new_input;
   wl_signal_add(&server.backend->events.new_input, &server.new_input);
   server.seat = wlr_seat_create(server.wl_display, "seat0");
+  server.request_cursor.notify = seat_request_cursor;
+  wl_signal_add(&server.seat->events.request_set_cursor,
+                &server.request_cursor);
+  server.request_set_selection.notify = seat_request_set_selection;
+  wl_signal_add(&server.seat->events.request_set_selection,
+                &server.request_set_selection);
 
-  // For DnD
+  // Drag-and-Drop (DnD) Input Intercept Engine
   server.start_drag.notify = server_handle_start_drag;
   wl_signal_add(&server.seat->events.start_drag, &server.start_drag);
   server.request_start_drag.notify = server_handle_request_start_drag;
@@ -1909,29 +2090,56 @@ int main(int argc, char *argv[]) {
   server.start_drag.notify = server_handle_start_drag;
   wl_signal_add(&server.seat->events.start_drag, &server.start_drag);
 
-  server.request_cursor.notify = seat_request_cursor;
-  wl_signal_add(&server.seat->events.request_set_cursor,
-                &server.request_cursor);
-  server.request_set_selection.notify = seat_request_set_selection;
-  wl_signal_add(&server.seat->events.request_set_selection,
-                &server.request_set_selection);
+  // PROTOCOLS
 
+  // wlr_xdg_shell
+  server.xdg_shell = wlr_xdg_shell_create(server.wl_display, 3);
+  server.new_xdg_surface.notify = server_new_xdg_surface;
+  wl_signal_add(&server.xdg_shell->events.new_surface, &server.new_xdg_surface);
 
-  // For xdg-activation-v1.xml
+  // xdg_activation_v1.xml
   server.xdg_activation = wlr_xdg_activation_v1_create(server.wl_display);
   server.request_activation.notify = server_request_activation;
   wl_signal_add(&server.xdg_activation->events.request_activate, 
                 &server.request_activation);
 
-  /* Add a Unix socket to the Wayland display. */
+  // wlr-screencopy-unstable-v1
+  wlr_screencopy_manager_v1_create(server.wl_display);
+
+  // zxdg_output_manager_v1
+  wlr_xdg_output_manager_v1_create(server.wl_display, server.output_layout);
+
+  // wlr_xdg_decoration_manager_v1
+  server.xdg_decoration_manager =
+      wlr_xdg_decoration_manager_v1_create(server.wl_display);
+  server.new_toplevel_decoration.notify = handle_new_toplevel_decoration;
+  wl_signal_add(&server.xdg_decoration_manager->events.new_toplevel_decoration, 
+                &server.new_toplevel_decoration);
+
+  // wlr_idle_notifier_v1
+  server.idle_notifier = wlr_idle_notifier_v1_create(server.wl_display);
+
+  // wlr_layer_shell_unstable_v1
+  wl_list_init(&server.layer_surfaces);
+  server.layer_shell = wlr_layer_shell_v1_create(server.wl_display, 4);
+  server.new_layer_surface.notify = server_new_layer_surface;
+  wl_signal_add(&server.layer_shell->events.new_surface,
+                &server.new_layer_surface);
+
+  // Automatically link monitors to the virtual desktop tree
+  // This belongs at the end of the initialization sequence
+  server.scene_layout =
+      wlr_scene_attach_output_layout(server.scene, server.output_layout);
+
+  // Add a Unix socket to the Wayland display.
   const char *socket = wl_display_add_socket_auto(server.wl_display);
   if (!socket) {
     wlr_backend_destroy(server.backend);
     return 1;
   }
 
-  /* Start the backend. This will enumerate outputs and inputs, become the DRM
-   * master, etc */
+  // Start the backend.
+  // This will enumerate outputs and inputs, become the DRM master, etc. 
   if (!wlr_backend_start(server.backend)) {
     wlr_backend_destroy(server.backend);
     wl_display_destroy(server.wl_display);
@@ -1946,15 +2154,11 @@ int main(int argc, char *argv[]) {
       execl("/bin/sh", "/bin/sh", "-c", startup_cmd, (void *)NULL);
     }
   }
-  /* Run the Wayland event loop. This does not return until you exit the
-   * compositor. Starting the backend rigged up all of the necessary event
-   * loop configuration to listen to libinput events, DRM events, generate
-   * frame events at the refresh rate, and so on. */
+  // Run the Wayland event loop.
   wlr_log(WLR_INFO, "Running Wayland compositor on WAYLAND_DISPLAY=%s", socket);
   wl_display_run(server.wl_display);
 
-  /* Once wl_display_run returns, we destroy all clients then shut down the
-   * server. */
+  // Destroy all clients then shut down the server. 
   wl_display_destroy_clients(server.wl_display);
   wlr_scene_node_destroy(&server.scene->tree.node);
   wlr_xcursor_manager_destroy(server.cursor_manager);
