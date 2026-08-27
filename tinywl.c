@@ -51,6 +51,10 @@
 // For wlr_xdg_decoration_manager_v1
 #include <wlr/types/wlr_xdg_decoration_v1.h>
 
+// For wlr_layer_shell_unstable_v1
+#include <wlr/types/wlr_layer_shell_v1.h>
+#include "wlr-layer-shell-unstable-v1-protocol.h"
+
 /* For brevity's sake, struct members are annotated where they are used. */
 enum tinywl_cursor_mode {
   TINYWL_CURSOR_PASSTHROUGH,
@@ -126,6 +130,11 @@ struct tinywl_server {
   // Up to two grabbed mouse buttons - to start and cancel an interaction
   uint32_t grabbed_active_button;
   uint32_t grabbed_cancel_button;
+
+  // For wlr_layer_shell_unstable_v1
+  struct wlr_layer_shell_v1 *layer_shell;
+  struct wl_list layer_surfaces;
+  struct wl_listener new_layer_surface; 
 };
 
 struct tinywl_output {
@@ -190,6 +199,21 @@ struct tinywl_popup {
   struct wl_listener destroy;
 };
 
+
+// For wlr_layer_shell_unstable_v1
+struct tinywl_layer_surface {
+  struct wl_list link;
+  struct tinywl_server *server;
+  struct wlr_layer_surface_v1 *wlr_layer_surface;
+  struct wlr_scene_layer_surface_v1 *scene_layer_surface;
+
+  struct wl_listener map;
+  struct wl_listener unmap;
+  struct wl_listener destroy;
+  struct wl_listener surface_commit;
+};
+
+
 // spawn a shell process
 static void spawn(const char *cmd) {
   // A standard doule-fork trick makes systemd deal with cleanup.
@@ -202,6 +226,66 @@ static void spawn(const char *cmd) {
     }
     _exit(0);
   }
+}
+
+// For wlr_layer_shell_unstable_v1
+static void handle_layer_map(struct wl_listener *listener, void *data) {
+}
+
+static void handle_layer_unmap(struct wl_listener *listener, void *data) {
+  /* Empty for now */
+}
+
+// For wlr_layer_shell_unstable_v1
+static void handle_layer_destroy(struct wl_listener *listener, void *data) {
+  struct tinywl_layer_surface *layer_surface = 
+      wl_container_of(listener, layer_surface, destroy);
+
+  wl_list_remove(&layer_surface->link);
+  wl_list_remove(&layer_surface->map.link);
+  wl_list_remove(&layer_surface->unmap.link);
+  wl_list_remove(&layer_surface->destroy.link);
+  free(layer_surface);
+}
+
+// For wlr_layer_shell_unstable_v1
+static void server_new_layer_surface(struct wl_listener *listener, void *data) {
+  struct tinywl_server *server = wl_container_of(listener, server, new_layer_surface);
+  struct wlr_layer_surface_v1 *wlr_layer_surface = data;
+
+  struct tinywl_layer_surface *layer_surface = calloc(1, sizeof(*layer_surface));
+  if (layer_surface == NULL) {
+    wlr_log(WLR_ERROR, "Failed to create a layer surface.");
+    return;
+  }
+  layer_surface->server = server;
+  layer_surface->wlr_layer_surface = wlr_layer_surface;
+
+  // Create the scene layer surface and attach it to the parent tree
+  layer_surface->scene_layer_surface =
+      wlr_scene_layer_surface_v1_create(&server->scene->tree, wlr_layer_surface);
+      
+  if (layer_surface->scene_layer_surface == NULL) {
+    wlr_log(WLR_ERROR, "Failed to create scene tree for layer surface.");
+    free(layer_surface);
+    return;
+  }
+
+  // Create the scene graph and attach it to the  root scene container
+  layer_surface->scene_layer_surface->tree->node.data = layer_surface;
+  wlr_layer_surface->data = layer_surface;
+
+  // Listen for lifecycle events 
+  layer_surface->map.notify = handle_layer_map;
+  wl_signal_add(&wlr_layer_surface->surface->events.map, &layer_surface->map);
+
+  layer_surface->unmap.notify = handle_layer_unmap;
+  wl_signal_add(&wlr_layer_surface->surface->events.unmap, &layer_surface->unmap);
+
+  layer_surface->destroy.notify = handle_layer_destroy;
+  wl_signal_add(&wlr_layer_surface->events.destroy, &layer_surface->destroy);
+
+  wl_list_insert(&server->layer_surfaces, &layer_surface->link);
 }
 
 // For wlr_idle_notifier_v1
@@ -559,7 +643,6 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel,
   struct wlr_xdg_surface *xdg_surface = wlr_xdg_surface_try_from_wlr_surface(surface);
   if (xdg_surface && xdg_surface->toplevel) {
     // If you clicked the dialog box, this activates the dialog box.
-    // If you clicked the main window, this activates the main window.
     wlr_xdg_toplevel_set_activated(xdg_surface->toplevel, true);
   } else {
     // Fallback security measure
@@ -1176,7 +1259,7 @@ static void popup_handle_commit(struct wl_listener *listener, void *data) {
     
     // Optional: If you implemented scene-graph or manual tracking, 
     // you would trigger a frame damage event here. 
-    // For raw tinywl, the main output frame loop handles general rendering.
+    // For raw tinywl, the output frame loop handles general rendering.
 }
 
 static void popup_handle_destroy(struct wl_listener *listener, void *data) {
@@ -1753,6 +1836,13 @@ int main(int argc, char *argv[]) {
   server.xdg_shell = wlr_xdg_shell_create(server.wl_display, 3);
   server.new_xdg_surface.notify = server_new_xdg_surface;
   wl_signal_add(&server.xdg_shell->events.new_surface, &server.new_xdg_surface);
+
+  // For wlr_layer_shell_unstable_v1
+  wl_list_init(&server.layer_surfaces);
+  server.layer_shell = wlr_layer_shell_v1_create(server.wl_display, 4);
+  server.new_layer_surface.notify = server_new_layer_surface;
+  wl_signal_add(&server.layer_shell->events.new_surface, &server.new_layer_surface);
+
 
   /*
    * Creates a cursor, which is a wlroots utility for tracking the cursor
