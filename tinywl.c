@@ -106,6 +106,9 @@ struct tinywl_server {
   struct wlr_allocator *allocator;
   struct wlr_scene *scene;
 
+  // For resizing "wireframe layout"
+  struct wlr_scene_rect *resize_preview_rect;
+
   // To be attached to scene, for wlr_layer_shell_unstable_v1
   struct wlr_scene_tree *scene_background;
   struct wlr_scene_tree *scene_bottom;
@@ -123,7 +126,7 @@ struct tinywl_server {
   struct wl_listener start_drag;
   struct wl_listener destroy_drag;
 
-  // For xdg-activation-v1.xml
+  // For xdg_activation_v1
   struct wlr_xdg_activation_v1 *xdg_activation;
   struct wl_listener request_activation;
 
@@ -172,11 +175,8 @@ struct tinywl_toplevel {
   struct wl_listener request_move;
   struct wl_listener request_resize;
 
-  // Added for moving windows, or resizing them throttled to the frame rate
+  // Added for moving windows
   struct wlr_box initial_geom;
-  int pending_width;
-  int pending_height;
-  bool resize_is_pending;
 
   // added listeners for maximize, fullscreen, asynchronous resize
   struct wl_listener request_maximize;
@@ -259,8 +259,6 @@ struct wl_list *get_layer_list(struct tinywl_server *server,
       return &server->top_layers;
   }
 }
-
-// Helper function to get the right
 
 // For wlr_layer_shell_unstable_v1
 static void arrange_layers(struct tinywl_server *server) {
@@ -558,29 +556,46 @@ static struct tinywl_toplevel *desktop_toplevel_at(struct tinywl_server *server,
   return NULL;
 }
 
-// Reset the cursor mode to passthrough.
+// End an interaction and reset the cursor mode to passthrough.
 static void end_interactive(struct tinywl_server *server) {
   if (server->cursor_mode == TINYWL_CURSOR_PASSTHROUGH) {
     return;
   }
+  struct tinywl_toplevel *toplevel = server->grabbed_toplevel;
 
-  // Clear out the server tracking state fields
+  if (server->cursor_mode == TINYWL_CURSOR_RESIZE) {
+    // Immediately reposition
+    int x = server->resize_preview_rect->node.x;
+    int y = server->resize_preview_rect->node.y;
+    wlr_scene_node_set_position(&toplevel->scene_tree->node, x, y);
+
+    // Request the app update the size
+    wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel,
+                              server->resize_preview_rect->width,
+                              server->resize_preview_rect->height);
+
+    // Destroy the rectangle
+    wlr_scene_node_destroy(&server->resize_preview_rect->node);
+    server->resize_preview_rect = NULL;
+  }
+
+  // Clear the server fields that track state
   server->cursor_mode = TINYWL_CURSOR_PASSTHROUGH;
   server->grabbed_toplevel = NULL;
-  
-  // Find what sits directly under the mouse pointer
+
+  // Find what sits under the mouse pointer
   double sx, sy;
   struct wlr_surface *surface = NULL;
   struct tinywl_toplevel *hover_toplevel = desktop_toplevel_at(
       server, server->cursor->x, server->cursor->y, &surface, &sx, &sy);
 
   if (!hover_toplevel) {
-    // Over completely empty space, restore default cursor arrow graphics
+    // Over empty space, restore default cursor arrow graphics
     wlr_cursor_set_xcursor(server->cursor, server->cursor_manager, "default");
   }
 
   if (surface) {
-    // Restore pointer focus immediately
+    // Restore pointer focus
     wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
   } else {
     // Clean slate if dropping the window layout structure over empty space
@@ -598,7 +613,7 @@ static void begin_interactive(struct tinywl_toplevel *toplevel,
   // Sanity check
   if (toplevel->xdg_toplevel->base->surface !=
       wlr_surface_get_root_surface(focused_surface)) {
-    wlr_log(WLR_ERROR, "Trying to interact with a toplevel and unrelated surface");
+    wlr_log(WLR_ERROR, "Interactive: toplevel and surface seem unrelated.");
     return;
   }
 
@@ -629,144 +644,175 @@ static void begin_interactive(struct tinywl_toplevel *toplevel,
   server->grabbed_cursor_y = server->cursor->y;
 }
 
-// Move the grabbed toplevel
-static void handle_interactive_move(struct tinywl_server *server, uint32_t time) {
-  struct tinywl_toplevel *toplevel = server->grabbed_toplevel;
-  if (toplevel == NULL) {
-    wlr_log(WLR_ERROR, "Trying to drag a NULL.");
+static void handle_cursor_motion(struct tinywl_server *server, uint32_t time) {
+
+  struct wlr_seat *seat = server->seat;
+  // Current cursor coordinates
+  int cx = server->cursor->x; 
+  int cy = server->cursor->y;
+
+  enum tinywl_cursor_mode mode = server->cursor_mode;
+
+  // If moving the mouse normally
+  if ((mode == TINYWL_CURSOR_PASSTHROUGH) && (!seat->drag)) {
+    double sx, sy;
+    struct wlr_surface *surface = NULL;
+    struct wlr_scene_node *node =
+        wlr_scene_node_at(&server->scene->tree.node, cx, cy, &sx, &sy);
+    if (node && node->type == WLR_SCENE_NODE_BUFFER) {
+      struct wlr_scene_buffer *scene_buffer =
+          wlr_scene_buffer_from_node(node);
+      struct wlr_scene_surface *scene_surface =
+          wlr_scene_surface_try_from_buffer(scene_buffer);
+      if (scene_surface) {
+        surface = scene_surface->surface;
+      }
+    }
+    if (!surface) {
+      // Hovering over empty space
+      wlr_seat_pointer_clear_focus(seat);
+      wlr_cursor_set_xcursor(server->cursor, server->cursor_manager, "default");
+    } else {
+      wlr_seat_pointer_notify_enter(seat, surface, sx, sy);
+      wlr_seat_pointer_notify_motion(seat, time, sx, sy);
+    }
     return;
   }
 
-  if (wl_list_empty(&toplevel->link)) {
-    wlr_log(WLR_INFO, "Grabbed window must have been destroyed mid-move.");
+  // If an active DnD is happening
+  if (server->current_drag) {
+
+    // position the icon
+    if (server->current_drag->icon) {
+      struct wlr_drag_icon *icon = seat->drag->icon;
+      int dx = icon->surface->current.dx;
+      int dy = icon->surface->current.dy;
+      struct wlr_scene_node *icon_node = icon->data;
+      if (icon_node) {
+        wlr_scene_node_set_position(icon_node, cx+dx, cy+dy);
+      }
+    }
+
+    // find the surface under the cursor
+    double sx = 0;
+    double sy = 0;
+    struct wlr_surface *surface = NULL;
+    struct wlr_scene_node *node = wlr_scene_node_at(
+        &server->scene->tree.node, server->cursor->x, server->cursor->y,
+        &sx, &sy);
+    if (node && node->type == WLR_SCENE_NODE_BUFFER) {
+      struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
+      struct wlr_scene_surface *scene_surface =
+          wlr_scene_surface_try_from_buffer(scene_buffer);
+      if (scene_surface) {
+        surface = scene_surface->surface;
+      }
+    }
+
+    // notify that surface, if there is one
+    if (!surface) {
+      wlr_seat_pointer_clear_focus(seat);
+    } else {
+      wlr_seat_pointer_notify_enter(seat, surface, sx, sy);
+      wlr_seat_pointer_notify_motion(seat, time, sx, sy);
+    }
+    
+    wlr_seat_pointer_notify_frame(seat);
+    return;
+  }
+
+  // Otherwise, a move or resize interaction is happening.
+
+  // Get the toplevel
+  struct tinywl_toplevel *toplevel = server->grabbed_toplevel;
+  if (!toplevel || wl_list_empty(&toplevel->link)) {
+    wlr_log(WLR_ERROR, "A window was destroyed mid-interaction");
     end_interactive(server);
     return;
   }
 
-  if (!toplevel->scene_tree) {
-    wlr_log(WLR_ERROR, "Trying to drag a NULL scene_tree.");
-    return;
-  }
-
-  // Coordinate math
-  int x = toplevel->initial_geom.x;
-  int y = toplevel->initial_geom.y;
-
-  int dx = server->cursor->x - server->grabbed_cursor_x;
-  int dy = server->cursor->y - server->grabbed_cursor_y;
-
-  x += dx;
-  y += dy;
-
-  // Re-position the window in your compositor layout tree
-  wlr_scene_node_set_position(&toplevel->scene_tree->node, x, y);
-}
-
-// Resize the grabbed toplevel at any corner or edge.
-static void handle_interactive_resize(struct tinywl_server *server, uint32_t time) {
-  struct tinywl_toplevel *toplevel = server->grabbed_toplevel;
-
-  wlr_seat_pointer_notify_motion(server->seat, time, server->cursor->x, server->cursor->y);
-
-  // Sanity checks
-  if (toplevel == NULL) {
-    wlr_log(WLR_ERROR, "Trying to resize a NULL.");
-    return;
-  }
-  if (wl_list_empty(&toplevel->link)) {
-    wlr_log(WLR_DEBUG, "Grabbed window must have been destroyed mid-resize.");
-    end_interactive(server);
-    return;
-  }
-  if (!toplevel->scene_tree) {
-    wlr_log(WLR_ERROR, "Trying to resize a NULL scene_tree.");
-    return;
-  }
-
-  // Mouse movement since the drag started
-  int dx = server->cursor->x - server->grabbed_cursor_x;
-  int dy = server->cursor->y - server->grabbed_cursor_y;
-
+  // Get the original geometry at the start of the interaction
+  int x = server->grabbed_toplevel->initial_geom.x;
+  int y = server->grabbed_toplevel->initial_geom.y;
   int width = toplevel->initial_geom.width;
   int height = toplevel->initial_geom.height;
 
+  // How much the cursor has moved
+  int dx = cx - server->grabbed_cursor_x;
+  int dy = cy - server->grabbed_cursor_y;
+
+  if (mode == TINYWL_CURSOR_MOVE) {
+    x += dx;
+    y += dy;
+    wlr_scene_node_set_position(&toplevel->scene_tree->node, x, y);
+    return;
+  }
+
   if (server->resize_edges & WLR_EDGE_TOP) {
     height -= dy;
+    y += dy;
   } else if (server->resize_edges & WLR_EDGE_BOTTOM) {
     height += dy;
   }
   if (server->resize_edges & WLR_EDGE_LEFT) {
     width -= dx;
+    x += dx;
   } else if (server->resize_edges & WLR_EDGE_RIGHT) {
     width += dx;
   }
-  
-  // Clamp
   int min_width = toplevel->xdg_toplevel->current.min_width;
   int min_height = toplevel->xdg_toplevel->current.min_height;
-  if (height < min_height) {
-    height = min_height;
+  if (width < min_width) width = min_width;
+  if (height < min_height) height = min_height;
+  if (width < 50) width = 50;
+  if (height < 50) height = 50;
+  // Draw a rectangle at x,y with width,height 
+  if (!server->resize_preview_rect) {
+    // Make it for the first time.
+    server->resize_preview_rect =
+        wlr_scene_rect_create(&server->scene->tree,
+                              width, height,
+                              (float[]){0.13f, 0.67f, 0.6f, 0.4f});
   }
-  if (width < min_width) {
-    width = min_width;
-  }
-
-  toplevel->pending_width = width;
-  toplevel->pending_height = height;
-  toplevel->resize_is_pending = true;
-
-  // I'm throttling client resize requests to the frame rate.
-  // This is a hack to make sure frames occasionally happen when running nested.
-  // It could be made more subtle in the case of multiple monitors.
-  struct tinywl_output *output;
-  wl_list_for_each(output, &server->outputs, link) {
-    wlr_output_schedule_frame(output->wlr_output);
-  }
+  wlr_scene_node_set_position(&server->resize_preview_rect->node, x, y);
+  wlr_scene_rect_set_size(server->resize_preview_rect, width, height);
 }
 
-static void handle_cursor_motion(struct tinywl_server *server, uint32_t time) {
-  // If the mode is non-passthrough, delegate to those functions.
-  switch (server->cursor_mode) {
-    case TINYWL_CURSOR_MOVE:
-      handle_interactive_move(server, time);
-      return;
-    case TINYWL_CURSOR_RESIZE:
-      handle_interactive_resize(server, time);
-      return;
-    default:
-      break;
+// For ending a DnD
+static void server_handle_destroy_drag(struct wl_listener *listener,
+                                       void *data) {
+  struct tinywl_server *server =
+      wl_container_of(listener, server, destroy_drag);
+
+  // Clear our active drag pointer
+  server->current_drag = NULL;
+
+  // Trigger the flag so the next mapped window maps at the cursor
+  server->drag_just_ended = true;
+
+  // Disconnect this temporary listener until the next drag happens
+  wl_list_remove(&server->destroy_drag.link);
+  wl_list_init(&server->destroy_drag.link); // eliminate dangling pointers
+}
+
+// For starting a DnD
+static void server_handle_start_drag(struct wl_listener *listener, void *data) {
+  struct tinywl_server *server = wl_container_of(listener, server, start_drag);
+  struct wlr_drag *drag = data;
+  struct wlr_drag_icon *icon = drag->icon;
+
+  server->current_drag = drag;
+  server->drag_just_ended = false;
+
+  if (icon) {
+    // Generate the scene node and save its reference in the icon's data slot
+    struct wlr_scene_tree *icon_tree =
+        wlr_scene_drag_icon_create(&server->scene->tree, icon);
+    icon->data = &icon_tree->node;
   }
 
-  // Find the exact scene graph node under the cursor
-  double sx, sy;
-  struct wlr_seat *seat = server->seat;
-  struct wlr_surface *surface = NULL;
-
-  // Use the scene graph root directly to see absolutely everything rendered
-  struct wlr_scene_node *node =
-      wlr_scene_node_at(&server->scene->tree.node, server->cursor->x,
-                        server->cursor->y, &sx, &sy);
-
-  if (node && node->type == WLR_SCENE_NODE_BUFFER) {
-    struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
-    struct wlr_scene_surface *scene_surface =
-        wlr_scene_surface_try_from_buffer(scene_buffer);
-    
-    if (scene_surface) {
-      surface = scene_surface->surface;
-    }
-  }
-
-  if (!surface) {
-    // Over empty space, set the cursor image to a default arrow
-    wlr_cursor_set_xcursor(server->cursor, server->cursor_manager, "default");
-    wlr_seat_pointer_clear_focus(seat);
-  } else {
-    // wlroots handles duplicate protection internally.
-    // sx and sy are already transformed into the local surface coordinate space.
-    wlr_seat_pointer_notify_enter(seat, surface, sx, sy);
-    wlr_seat_pointer_notify_motion(seat, time, sx, sy);
-  }
+  server->destroy_drag.notify = server_handle_destroy_drag;
+  wl_signal_add(&drag->events.destroy, &server->destroy_drag);
 }
 
 // Unfocus
@@ -843,7 +889,8 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel,
   }
       
   // For dialog boxes
-  struct wlr_xdg_surface *xdg_surface = wlr_xdg_surface_try_from_wlr_surface(surface);
+  struct wlr_xdg_surface *xdg_surface =
+      wlr_xdg_surface_try_from_wlr_surface(surface);
   if (xdg_surface && xdg_surface->toplevel) {
     // If you clicked the dialog box, this activates the dialog box.
     wlr_xdg_toplevel_set_activated(xdg_surface->toplevel, true);
@@ -863,27 +910,6 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel,
   }
 }
 
-// For DnD
-static void update_drag_icon_position(struct tinywl_server *server) {
-  if (!server->current_drag || !server->drag_icon_tree) {
-    return;
-  }
-
-  // Explicitly cast coordinates to clean integers (matching pixels)
-  int x = (int)server->cursor->x;
-  int y = (int)server->cursor->y;
-
-  struct wlr_scene_node *node = &server->drag_icon_tree->node;
-
-  // If the drag icon tree node is at this layout coordinate, do nothing
-  if (node->x == x && node->y == y) {
-    return;
-  }
-
-  // Only update and re-render if the cursor actually jumped to a new pixel
-  wlr_scene_node_set_position(node, x, y);
-}
-
 // Triggered by a relative pointer motion event
 static void server_cursor_motion(struct wl_listener *listener, void *data) {
   struct tinywl_server *server =
@@ -892,8 +918,6 @@ static void server_cursor_motion(struct wl_listener *listener, void *data) {
   wlr_cursor_move(server->cursor, &event->pointer->base,
                   event->delta_x, event->delta_y);
   handle_cursor_motion(server, event->time_msec);
-  update_drag_icon_position(server); // for DnD
-  wlr_idle_notifier_v1_notify_activity(server->idle_notifier, server->seat);
 }
 
 // Triggered by an absolute pointer motion event,
@@ -906,7 +930,6 @@ static void server_cursor_motion_absolute(struct wl_listener *listener,
   wlr_cursor_warp_absolute(server->cursor, &event->pointer->base,
                            event->x, event->y);
   handle_cursor_motion(server, event->time_msec);
-  wlr_idle_notifier_v1_notify_activity(server->idle_notifier, server->seat);
 }
 
 static bool is_popup_at(struct tinywl_server *server, double lx, double ly) {
@@ -940,7 +963,8 @@ static bool is_popup_at(struct tinywl_server *server, double lx, double ly) {
     
 // Triggered by a mouse click or release
 static void server_cursor_button(struct wl_listener *listener, void *data) {
-  struct tinywl_server *server = wl_container_of(listener, server, cursor_button);
+  struct tinywl_server *server =
+      wl_container_of(listener, server, cursor_button);
   struct wlr_pointer_button_event *event = data;
   uint32_t modifiers =
       wlr_keyboard_get_modifiers(wlr_seat_get_keyboard(server->seat));
@@ -952,7 +976,7 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
   // release the button that started a mod+click interaction
   if ((event->state == WL_POINTER_BUTTON_STATE_PRESSED) && // redundant
       (event->button == server->grabbed_active_button)) {
-    // note it must be button release
+    // it must be a button release, no need to check
     server->grabbed_active_button = 0;
     if (server->cursor_mode != TINYWL_CURSOR_PASSTHROUGH) {
       end_interactive(server);
@@ -999,16 +1023,20 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 
   // NOTIFY THE SEAT IN EVERY REMAINING CASE
 
+  wlr_log(WLR_DEBUG, "Seat will be notified of cursor button event.");
+
   // Any release that was not grabbed
   if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
-    end_interactive(server);
     wlr_seat_pointer_notify_button(server->seat, event->time_msec,
                                    event->button, event->state);
     wlr_seat_pointer_notify_frame(server->seat);
+    if (server->cursor_mode != TINYWL_CURSOR_PASSTHROUGH) {
+      end_interactive(server);
+    }
     return;
   }
 
-  // button press on a popup - I think it must already have focus, so do nothing else
+  // button press on a popup - it must already have focus, so do nothing else
   if (is_popup_at(server, server->cursor->x, server->cursor->y)) {
     wlr_seat_pointer_notify_button(server->seat, event->time_msec,
                                    event->button, event->state);
@@ -1027,7 +1055,6 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
           wl_container_of(pops->next, pop, link);
       wlr_xdg_popup_destroy(pop);
     }
-    wlr_log(WLR_DEBUG, "Popups dismissed.");
   }
 
   // Set keyboard focus
@@ -1050,6 +1077,7 @@ static void server_cursor_axis(struct wl_listener *listener, void *data) {
   wlr_seat_pointer_notify_axis(server->seat, event->time_msec,
                                event->orientation, event->delta,
                                event->delta_discrete, event->source);
+  wlr_seat_pointer_notify_frame(server->seat);
 }
 
 // Function triggered by a pointer frame event, grouping multiple events.
@@ -1064,17 +1092,6 @@ static void output_frame(struct wl_listener *listener, void *data) {
   struct tinywl_output *output = wl_container_of(listener, output, frame);
   struct tinywl_server *server = output->server;
   struct wlr_scene *scene = server->scene;
-
-  // Send resizing requests here, so they "only" get sent at the frame rate
-  if (server->cursor_mode == TINYWL_CURSOR_RESIZE) {
-    struct tinywl_toplevel *toplevel = server->grabbed_toplevel;
-    if (toplevel->resize_is_pending) {
-      wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel, toplevel->pending_width,
-                                toplevel->pending_height);
-      wlr_xdg_surface_schedule_configure(toplevel->xdg_toplevel->base);
-      toplevel->resize_is_pending = false;
-    }
-  }
 
   struct wlr_scene_output *scene_output =
       wlr_scene_get_scene_output(scene, output->wlr_output);
@@ -1174,17 +1191,17 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
   if (server->drag_just_ended) {
     // Intercept placement after drag, added for DnD and tearoff tabs
     server->drag_just_ended = false;
-    int spawn_x = (int)server->cursor->x;
-    int spawn_y = (int)server->cursor->y;
-    wlr_scene_node_set_position(&toplevel->scene_tree->node, spawn_x, spawn_y);
+    int x = (int)server->cursor->x;
+    int y = (int)server->cursor->y;
+    wlr_scene_node_set_position(&toplevel->scene_tree->node, x, y);
   } else {
     wlr_scene_node_set_position(&toplevel->scene_tree->node, 50, 50);
   }
 
-  // Track the window state
+  // Add to our tracking list
   wl_list_insert(&toplevel->server->toplevels, &toplevel->link);
   
-  // Explicitly enable this specific window's visual node.
+  // Explicitly enable the window's visual node.
   wlr_scene_node_set_enabled(&toplevel->scene_tree->node, true);
 
   // Focus the window
@@ -1355,8 +1372,10 @@ static void xdg_toplevel_request_fullscreen(struct wl_listener *listener,
 
 // Maximize. Assume there are no status bars.
 // Do not save the previous size.
-static void xdg_toplevel_request_maximize(struct wl_listener *listener, void *data) {
-  struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, request_maximize);
+static void xdg_toplevel_request_maximize(struct wl_listener *listener,
+                                          void *data) {
+  struct tinywl_toplevel *toplevel =
+      wl_container_of(listener, toplevel, request_maximize);
   struct tinywl_server *server = toplevel->server;
 
   // Look up the monitor under the cursor
@@ -1383,7 +1402,8 @@ static void xdg_toplevel_request_maximize(struct wl_listener *listener, void *da
 // Called every time the client updates its surface buffer.
 // Adjust the boundaries of the scene graph node so the frame can be drawn.
 static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
-  struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, commit);
+  struct tinywl_toplevel *toplevel =
+      wl_container_of(listener, toplevel, commit);
   struct tinywl_server *server = toplevel->server;
   struct wlr_xdg_surface *xdg_surface = toplevel->xdg_toplevel->base;
 
@@ -1391,31 +1411,7 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
   if (xdg_surface->initial_commit) {
     return;
   }
-
-  // Extract the actual geometry the application just committed
-
-  // Do nothing UNLESS we are actively resizing from top/left edges
-  if (server->cursor_mode == TINYWL_CURSOR_RESIZE) {
-    struct wlr_box geom;
-    wlr_xdg_surface_get_geometry(xdg_surface, &geom);
-
-    if (server->resize_edges & (WLR_EDGE_LEFT | WLR_EDGE_TOP)) {
-      int32_t x = toplevel->initial_geom.x;
-      int32_t y = toplevel->initial_geom.y;
-
-      if (server->resize_edges & WLR_EDGE_LEFT) {
-        x += toplevel->initial_geom.width - geom.width;
-      }
-      if (server->resize_edges & WLR_EDGE_TOP) {
-        y += toplevel->initial_geom.height - geom.height;
-      }
-
-      // Reposition the window node on screen to keep the anchor point pinned
-      wlr_scene_node_set_position(&toplevel->scene_tree->node, x, y);
-    }
-  }
 }
-
 
 static void popup_handle_commit(struct wl_listener *listener, void *data) {
     // In wlroots 0.17, committing a popup surface requires scheduling a repaint
@@ -1534,7 +1530,7 @@ static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
   wl_signal_add(&xdg_surface->toplevel->events.request_fullscreen, &toplevel->request_fullscreen);
 }
   
-// For xdg-activation-v1.xml - when you click on a link to open a browser
+// For xdg_activation_v1 - when you click on a link to open a browser
 static void server_request_activation(struct wl_listener *listener, void *data) {
   struct tinywl_server *server = 
       wl_container_of(listener, server, request_activation);
@@ -1559,63 +1555,21 @@ static void server_request_activation(struct wl_listener *listener, void *data) 
   }
 }
 
+// For DnD
 static void server_handle_request_start_drag(struct wl_listener *listener,
                                              void *data) {
   struct wlr_seat_request_start_drag_event *event = data;
   struct tinywl_server *server =
       wl_container_of(listener, server, request_start_drag);
 
-  // Validate the drag request (check if the serial matches an implicit mouse
-  // grab)
-  if (wlr_seat_validate_pointer_grab_serial(server->seat, event->origin,
+  if (!wlr_seat_validate_pointer_grab_serial(server->seat, event->origin,
                                             event->serial)) {
-    wlr_seat_start_pointer_drag(server->seat, event->drag, event->serial);
-  } else {
-    // Reject the drag if the serial is invalid or outdated
+    // click state does not match active seat state
     wlr_data_source_destroy(event->drag->source);
+    return;
   }
-}
 
-// For DnD
-static void handle_destroy_drag(struct wl_listener *listener, void *data) {
-    struct tinywl_server *server = wl_container_of(listener, server, destroy_drag);
-
-    // Completely destroy the scene tree (removes it from screen graphics)
-    if (server->drag_icon_tree) {
-        wlr_scene_node_destroy(&server->drag_icon_tree->node);
-        server->drag_icon_tree = NULL;
-    }
-
-    server->drag_just_ended = true; // for tag tearing
-
-    server->current_drag = NULL;
-    wl_list_remove(&server->destroy_drag.link);
-    wl_list_init(&server->destroy_drag.link);
-}
-
-// For DnD
-static void server_handle_start_drag(struct wl_listener *listener, void *data) {
-    struct tinywl_server *server = wl_container_of(listener, server, start_drag);
-    struct wlr_drag *drag = data;
-
-    server->current_drag = drag;
-
-    server->drag_just_ended = false; // for tag tearing
-
-    // Create a new scene node tree for the drag icon attached to the root scene
-    server->drag_icon_tree = wlr_scene_tree_create(&server->scene->tree);
-
-    if (drag->icon) {
-        // Automatically link the drag icon's surface to our scene tree
-        wlr_scene_drag_icon_create(server->drag_icon_tree, drag->icon);
-    }
-
-    // Set up the destroy listener to clean it all up when done
-    server->destroy_drag.notify = handle_destroy_drag;
-    wl_signal_add(&drag->events.destroy, &server->destroy_drag);
-    
-    // Instantly position the icon under the mouse right now
-    update_drag_icon_position(server);
+  wlr_seat_start_pointer_drag(server->seat, event->drag, event->serial);
 }
 
 // Function triggered when a modifier key is pressed.
@@ -2002,14 +1956,8 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  // Data Device Manager Protocol
-  // for copy/paste and DnD
-  struct wlr_data_device_manager *data_device_manager =
-      wlr_data_device_manager_create(server.wl_display);
-  if (data_device_manager == NULL) {
-    wlr_log(WLR_ERROR, "Failed to create data device manager");
-    return 1;
-  }
+  // Data Device Manager Protocol, for copy/paste and DnD
+  wlr_data_device_manager_create(server.wl_display);
 
   // wlroots interface for clients to allocate surfaces.
   wlr_compositor_create(server.wl_display, 5, server.renderer);
@@ -2082,8 +2030,6 @@ int main(int argc, char *argv[]) {
                 &server.request_set_selection);
 
   // Drag-and-Drop (DnD) Input Intercept Engine
-  server.start_drag.notify = server_handle_start_drag;
-  wl_signal_add(&server.seat->events.start_drag, &server.start_drag);
   server.request_start_drag.notify = server_handle_request_start_drag;
   wl_signal_add(&server.seat->events.request_start_drag,
                 &server.request_start_drag);
