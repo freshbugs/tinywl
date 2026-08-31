@@ -1,4 +1,5 @@
 I am going to slowly add features to tinywl.
+This uses the wlroots library version 0.17.
 Following is the original readme.
 
 # TinyWL
