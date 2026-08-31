@@ -212,8 +212,12 @@ struct tinywl_popup {
   struct wl_listener destroy;
 };
 
-
 // For wlr_layer_shell_unstable_v1
+struct tinywl_layer_popup {
+  struct wlr_scene_tree *scene_tree;
+  struct wl_listener destroy;
+};
+
 struct tinywl_layer_surface {
   struct wl_list link;
   struct tinywl_server *server;
@@ -391,19 +395,63 @@ static void handle_layer_commit(struct wl_listener *listener, void *data) {
   }
 }
 
-// popups for wlr_layer_shell_unstable_v1
-static void handle_layer_new_popup(struct wl_listener *listener, void *data) {
+// Process the destruction of an active Layer Shell popup instance
+static void layer_popup_handle_destroy(struct wl_listener *listener, void *data) {
+  // Extract our tracking wrapper using the newly standardized structure name
+  struct tinywl_layer_popup *layer_popup = 
+      wl_container_of(listener, layer_popup, destroy);
+
+  // Unlink the temporary destroy signal hook cleanly
+  wl_list_remove(&layer_popup->destroy.link);
+
+  // Free the allocated heap block for this specific popup tracking instance
+  free(layer_popup);
+}
+
+// Handle a new popup request from a layer shell surface
+// For popups and wlr_layer_shell_unstable_v1
+static void layer_surface_handle_new_popup(struct wl_listener *listener,
+                                           void *data) {
+  // Extract the parent layer shell surface that spawned this menu
   struct tinywl_layer_surface *layer_surface =
       wl_container_of(listener, layer_surface, new_popup);
   struct wlr_xdg_popup *popup = data;
-  // Attach the popup to the status bar's own visual scene graph folder tree
-  struct wlr_scene_tree *popup_tree = wlr_scene_xdg_surface_create(
+
+  // Allocate our tracking wrapper for this popup instance
+  struct tinywl_layer_popup *layer_popup = calloc(1, sizeof(*layer_popup));
+  if (layer_popup == NULL) {
+    wlr_log(WLR_ERROR, "Failed to create a layer popup instance.");
+    return;
+  }
+
+  // Attach the popup directly onto the status bar's own visual scene graph tree
+  layer_popup->scene_tree = wlr_scene_xdg_surface_create(
       layer_surface->scene_layer_surface->tree, popup->base);
-  // Save the scene tree pointer inside the popup surface data 
-  popup->base->surface->data = popup_tree;
+  
+  // Save the reference in the raw surface data slot for input lookup routing
+  popup->base->surface->data = layer_popup->scene_tree;
+
+  // Make it respect screen borders
+  struct wlr_box output_box;
+  struct wlr_output *output =
+      wlr_output_layout_output_at(layer_surface->server->output_layout,
+                                  layer_surface->server->cursor->x,
+                                  layer_surface->server->cursor->y);
+  wlr_output_layout_get_box(layer_surface->server->output_layout,
+                            output, &output_box);
+  wlr_xdg_popup_unconstrain_from_box(popup, &output_box);
+
+  // Position the node using the coordinates computed by the unconstrain tool
+  wlr_scene_node_set_position(&layer_popup->scene_tree->node,
+                              popup->current.geometry.x,
+                              popup->current.geometry.y);
+
+  // Set up a listener to destroy the popup
+  layer_popup->destroy.notify = layer_popup_handle_destroy;
+  wl_signal_add(&popup->base->events.destroy, &layer_popup->destroy);
 }
 
-// For wlr_layer_shell_unstable_v1
+
 static void server_new_layer_surface(struct wl_listener *listener, void *data) {
   struct tinywl_server *server =
       wl_container_of(listener, server, new_layer_surface);
@@ -457,7 +505,7 @@ static void server_new_layer_surface(struct wl_listener *listener, void *data) {
   surface->destroy.notify = handle_layer_destroy;
   wl_signal_add(&wlr_layer_surface->events.destroy, &surface->destroy);
 
-  surface->new_popup.notify = handle_layer_new_popup;
+  surface->new_popup.notify = layer_surface_handle_new_popup;
   wl_signal_add(&wlr_layer_surface->events.new_popup, &surface->new_popup);
 
   surface->commit.notify = handle_layer_commit;
@@ -1046,13 +1094,17 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 
   // It is a normal click that is not on a popup
 
-  // Dismiss all popups
+  // Tell the active seat to release its current pointer
+  if (server->seat->pointer_state.grab != NULL) {
+    wlr_seat_pointer_end_grab(server->seat);
+  }
+
+  // Clear popups
   struct tinywl_toplevel *top;
   wl_list_for_each(top, &server->toplevels, link) {
+    struct wlr_xdg_popup *pop, *next_pop;
     struct wl_list *pops = &top->xdg_toplevel->base->popups;
-    while (!wl_list_empty(pops)) {
-      struct wlr_xdg_popup *pop =
-          wl_container_of(pops->next, pop, link);
+    wl_list_for_each_safe(pop, next_pop, pops, link) {
       wlr_xdg_popup_destroy(pop);
     }
   }
@@ -1413,37 +1465,19 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
   }
 }
 
-static void popup_handle_commit(struct wl_listener *listener, void *data) {
-    // In wlroots 0.17, committing a popup surface requires scheduling a repaint
-    struct tinywl_popup *popup = wl_container_of(listener, popup, commit);
-    wlr_log(WLR_DEBUG, "popup handle commit.");
-    
-    if (popup->xdg_popup->base->initial_commit) {
-        // First commit, nothing to damage yet
-        return;
-    }
-    
-    // Optional: If you implemented scene-graph or manual tracking, 
-    // you would trigger a frame damage event here. 
-    // For raw tinywl, the output frame loop handles general rendering.
-}
-
-static void popup_handle_destroy(struct wl_listener *listener, void *data) {
-  wlr_log(WLR_DEBUG, "popup handle destroy.");
-  struct tinywl_popup *popup = wl_container_of(listener, popup, destroy);
-
-  wl_list_remove(&popup->commit.link);
-  wl_list_remove(&popup->destroy.link);
-  
-  free(popup);
-}
-
 // For wlr_xdg_decoration_manager_v1
 static void handle_new_toplevel_decoration(struct wl_listener *listener, void *data) {
   struct wlr_xdg_toplevel_decoration_v1 *decoration = data;
   // Tell the client to draw its own window decorations
   wlr_xdg_toplevel_decoration_v1_set_mode(decoration, 
         WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
+}
+
+// Invoked when an application tells the compositor a context menu has closed
+static void xdg_popup_handle_destroy(struct wl_listener *listener, void *data) {
+  struct tinywl_popup *popup = wl_container_of(listener, popup, destroy);
+  wl_list_remove(&popup->destroy.link);
+  free(popup);
 }
 
 // Event raised when client sends a new xdg surface to wlr_xdg_shell
@@ -1453,30 +1487,63 @@ static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
   struct wlr_xdg_surface *xdg_surface = data;
 
   if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_POPUP) {
+    struct wlr_xdg_popup *xdg_popup = xdg_surface->popup;
 
-    // Find the popup's parent
-    struct wlr_surface *parent = xdg_surface->popup->parent;
-    if (parent == NULL) {
-      wlr_log(WLR_ERROR, "orphan popup.");
+    // 1. Allocate your custom popup tracking container wrapper
+    struct tinywl_popup *popup = calloc(1, sizeof(struct tinywl_popup));
+    if (!popup) {
+      wlr_log(WLR_ERROR, "Failed to allocate memory for popup tracking.");
       return;
     }
-
-    // Find the parent's scene node
-    struct wlr_scene_tree *parent_tree = parent->data;
-    if (parent_tree == NULL) {
-      wlr_log(WLR_ERROR, "popup parent has no scene.");
-      return;
-    }
-
-    // Attach the popup to the parent's scene tree.
-    struct wlr_scene_tree *popup_tree = 
-        wlr_scene_xdg_surface_create(parent_tree, xdg_surface);
     
-    // Save this scene node pointer for future sub-popups to see.
-    xdg_surface->surface->data = popup_tree;
+    // Assign custom surface type tags for your server_is_popup_at climbing engine
+    popup->type = TINYWL_SURFACE_POPUP;
+    popup->xdg_popup = xdg_popup;
 
+    // 2. FIND THE PARENT COMPOSITOR WINDOW TREE
+    // FIXED: Use wlr_xdg_surface_try_from_wlr_surface to accurately translate the type
+    struct wlr_xdg_surface *parent_xdg = wlr_xdg_surface_try_from_wlr_surface(xdg_popup->parent);
+    struct wlr_scene_tree *parent_tree = &server->scene->tree; // Fallback to root if parent missing
+    
+    if (parent_xdg && parent_xdg->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
+      struct tinywl_toplevel *toplevel = parent_xdg->data;
+      if (toplevel && toplevel->scene_tree) {
+        parent_tree = toplevel->scene_tree; // Anchor the popup directly to the active application window!
+      }
+    }
+
+    // 3. Attach the popup to the validated scene graph tree folder branch
+    popup->scene_tree = wlr_scene_xdg_surface_create(parent_tree, xdg_surface);
+    if (!popup->scene_tree) {
+      free(popup);
+      return;
+    }
+
+    // Tag the scene graph node memory space so server_is_popup_at can scan it
+    popup->scene_tree->node.data = popup;
+
+    // 4. UNCONSTRAIN MESH: Force the popup to flip or slide if it touches monitor bevels
+    struct wlr_box output_box;
+    struct wlr_output *output = wlr_output_layout_output_at(
+        server->output_layout, server->cursor->x, server->cursor->y);
+    if (output) {
+      wlr_output_layout_get_box(server->output_layout, output, &output_box);
+      wlr_xdg_popup_unconstrain_from_box(xdg_popup, &output_box);
+    }
+
+    // 5. Position the menu using coordinates generated by the layout calculator
+    wlr_scene_node_set_position(&popup->scene_tree->node,
+                                xdg_popup->current.geometry.x,
+                                xdg_popup->current.geometry.y);
+
+    // 6. TEARDOWN INTERCEPT: Connect your clean object-action destroy callback handler
+    popup->destroy.notify = xdg_popup_handle_destroy;
+    wl_signal_add(&xdg_popup->base->events.destroy, &popup->destroy);
     return;
   }
+
+
+
 
   // It's a regular toplevel, not a popup.
 
