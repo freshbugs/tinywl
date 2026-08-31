@@ -1565,8 +1565,10 @@ static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
     free(toplevel);
     return;
   }
+
   toplevel->scene_tree->node.data = toplevel;
-  xdg_surface->surface->data = toplevel->scene_tree;
+  xdg_surface->data = toplevel;
+  xdg_surface->surface->data = toplevel;
 
   // Set up listeners
   // Core Surface Layer Events (map, unmap, commit)
@@ -1612,8 +1614,8 @@ static void server_request_activation(struct wl_listener *listener, void *data) 
       wlr_xdg_surface_try_from_wlr_surface(event->surface);
 
   if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL && xdg_surface->data) {
-    struct wlr_scene_tree *scene_tree = xdg_surface->data;
-    struct tinywl_toplevel *toplevel = scene_tree->node.data;
+    struct tinywl_toplevel *toplevel = xdg_surface->data;
+    struct wlr_scene_tree *scene_tree = toplevel->scene_tree;
   
     if (toplevel) {
       // Focus the window that the link is trying to open
