@@ -210,6 +210,7 @@ struct tinywl_popup {
   struct wlr_scene_tree *scene_tree;
   struct wl_listener commit;
   struct wl_listener destroy;
+  struct wl_listener grab;
 };
 
 // For wlr_layer_shell_unstable_v1
@@ -1071,56 +1072,82 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 
   // NOTIFY THE SEAT IN EVERY REMAINING CASE
 
-  wlr_log(WLR_DEBUG, "Seat will be notified of cursor button event.");
+  // Let the unified scene-graph raycaster find what's under the cursor
 
-  // Any release that was not grabbed
-  if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
-    wlr_seat_pointer_notify_button(server->seat, event->time_msec,
-                                   event->button, event->state);
-    wlr_seat_pointer_notify_frame(server->seat);
-    if (server->cursor_mode != TINYWL_CURSOR_PASSTHROUGH) {
-      end_interactive(server);
-    }
-    return;
-  }
+  // Let the unified scene-graph raycaster find what's under the cursor
+  struct wlr_scene_node *node = wlr_scene_node_at(
+      &server->scene->tree.node, server->cursor->x, server->cursor->y, &sx, &sy);
 
-  // button press on a popup - it must already have focus, so do nothing else
-  if (is_popup_at(server, server->cursor->x, server->cursor->y)) {
-    wlr_seat_pointer_notify_button(server->seat, event->time_msec,
-                                   event->button, event->state);
-    wlr_seat_pointer_notify_frame(server->seat);
-    return;
-  }
-
-  // It is a normal click that is not on a popup
-
-  // Tell the active seat to release its current pointer
-  if (server->seat->pointer_state.grab != NULL) {
-    wlr_seat_pointer_end_grab(server->seat);
-  }
-
-  // Clear popups
-  struct tinywl_toplevel *top;
-  wl_list_for_each(top, &server->toplevels, link) {
-    struct wlr_xdg_popup *pop, *next_pop;
-    struct wl_list *pops = &top->xdg_toplevel->base->popups;
-    wl_list_for_each_safe(pop, next_pop, pops, link) {
-      wlr_xdg_popup_destroy(pop);
+  if (node && node->type == WLR_SCENE_NODE_BUFFER) {
+    struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
+    struct wlr_scene_surface *scene_surface = wlr_scene_surface_try_from_buffer(scene_buffer);
+    if (scene_surface) {
+      surface = scene_surface->surface;
     }
   }
 
-  // Set keyboard focus
-  if (toplevel == NULL) {
-    unfocus_toplevel(server);
+  // WINDOW ACTIVATION on PRESS
+  if (event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
+    if (surface) {
+
+      struct tinywl_toplevel *toplevel = NULL;
+      struct wlr_scene_node *current_node = node;
+
+      // Walk up the tree to find if this surface belongs to a managed toplevel
+      while (current_node != NULL) {
+        if (current_node->data != NULL) {
+          toplevel = current_node->data;
+          break;
+        }
+        current_node = &current_node->parent->node;
+      }
+      
+      // If we found a parent toplevel, handle its activation / focus
+      if (toplevel) {
+        struct wlr_surface *current_focused_surface =
+            server->seat->keyboard_state.focused_surface;
+        bool is_already_focused = false;
+        if (current_focused_surface) {
+          if (current_focused_surface ==
+              toplevel->xdg_toplevel->base->surface) {
+            is_already_focused = true;
+          }
+          // Also check if the focused surface is this window's popup
+          else if (
+              wlr_xdg_surface_try_from_wlr_surface(current_focused_surface)
+              != NULL) {
+            is_already_focused = true; 
+          }
+        }
+
+        if (!is_already_focused) {
+            wlr_scene_node_raise_to_top(&toplevel->scene_tree->node);
+            wl_list_remove(&toplevel->link);
+            wl_list_insert(&server->toplevels, &toplevel->link);
+
+            // Give keyboard focus to this window and surface
+            focus_toplevel(toplevel, surface);
+        }
+      }
+    } else {
+      // clear keyboard focus if clicking completely empty desktop space
+      wlr_seat_keyboard_clear_focus(server->seat);
+    }
+  }
+
+  // POINTER ROUTING for PRESS and RELEASE
+  // Send coordinates and button state to the target surface
+  if (surface) {
+    wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
+    wlr_seat_pointer_notify_button(server->seat, event->time_msec,
+                                   event->button, event->state);
   } else {
-    focus_toplevel(toplevel, surface);
+    wlr_seat_pointer_clear_focus(server->seat);
   }
 
-  // Notify
-  wlr_seat_pointer_notify_button(server->seat, event->time_msec,
-                                 event->button, event->state);
+  // Terminate the Wayland frame bucket
   wlr_seat_pointer_notify_frame(server->seat);
-} 
+}
 
 // Function triggered by a pointer axis event, eg. scroll wheel.
 static void server_cursor_axis(struct wl_listener *listener, void *data) {
@@ -1539,6 +1566,7 @@ static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
     // 6. TEARDOWN INTERCEPT: Connect your clean object-action destroy callback handler
     popup->destroy.notify = xdg_popup_handle_destroy;
     wl_signal_add(&xdg_popup->base->events.destroy, &popup->destroy);
+
     return;
   }
 
