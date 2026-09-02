@@ -17,5 +17,4 @@ export GDK_BACKEND=wayland
 
 exec /home/stephen/tinywl/tinywl -s "
   dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP=wlroots
-  foot"
-  >/home/stephen/tinywl/tinywl.log 2>&1
+  foot" >/home/stephen/tinywl/tinywl.log 2>&1
