@@ -357,12 +357,6 @@ void arrange_layers(struct tinywl_server *server) {
   }
 }
 
-
-
-
-
-
-
 // For wlr_layer_shell_unstable_v1 
 // Called once when a layer surface becomes visible
 static void handle_layer_map(struct wl_listener *listener, void *data) {
@@ -371,6 +365,25 @@ static void handle_layer_map(struct wl_listener *listener, void *data) {
   struct tinywl_server *server = surface->server;
   wlr_scene_node_set_enabled(&surface->scene_layer_surface->tree->node, true);
   arrange_layers(server);
+
+  // Let it grab focus
+  struct wlr_layer_surface_v1 *wlr_layer_surface = surface->scene_layer_surface->layer_surface;
+  
+  // Check if the client requested an exclusive keyboard grab
+  if (wlr_layer_surface->current.keyboard_interactive ==
+      ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE) {
+      
+    // Tell the wlroots seat to route keyboard events to this surface
+    struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(server->seat);
+    if (keyboard != NULL) {
+      wlr_seat_keyboard_notify_enter(
+          server->seat, 
+          wlr_layer_surface->surface, 
+          keyboard->keycodes, 
+          keyboard->num_keycodes, 
+          &keyboard->modifiers);
+    }
+  }
 }
 
 static void handle_layer_unmap(struct wl_listener *listener, void *data) {
@@ -890,29 +903,33 @@ static void server_handle_start_drag(struct wl_listener *listener, void *data) {
   wl_signal_add(&drag->events.destroy, &server->destroy_drag);
 }
 
-// Unfocus
-static void unfocus_toplevel(struct tinywl_server *server) {
+// Clear keyboard focus from whatever surface currently holds it
+static void unfocus_keyboard(struct tinywl_server *server) {
   struct wlr_seat *seat = server->seat;
   struct wlr_surface *prev_surface = seat->keyboard_state.focused_surface;
 
-  // Clear grabbed keys
+  // Clear compositor-specific key grabs
   struct tinywl_keyboard *kbd;
   wl_list_for_each(kbd, &server->keyboards, link) {
     kbd->grabbed_keycode = 0;
   }
 
-  // Visually deactivate the old window if one was focused
-  if (prev_surface) {
+  // Deactivate visually based on surface type
+  if (prev_surface != NULL) {
+    // Try treating it as a standard application window (XDG Toplevel)
     struct wlr_xdg_toplevel *prev_toplevel =
         wlr_xdg_toplevel_try_from_wlr_surface(prev_surface);
     if (prev_toplevel != NULL) {
       wlr_xdg_toplevel_set_activated(prev_toplevel, false);
     }
+    
+    // TO DO: visually de-activate?
   }
-
-  // Notify the seat and underlying wlroots architecture
+    
+  // Notify the seat to completely strip the keyboard focus
   wlr_seat_keyboard_notify_clear_focus(seat);
 }
+
 
 // Focus: Unfocus old stuff, raise, and notify
 static void focus_toplevel(struct tinywl_toplevel *toplevel) {
@@ -922,8 +939,10 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel) {
     wlr_log(WLR_ERROR, "Trying to focus an invalid toplevel.");
     return;
   }
-  
   struct tinywl_server *server = toplevel->server;
+  // Unfocus the old window
+  unfocus_keyboard(server);
+  
   struct wlr_seat *seat = server->seat;
   struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
   struct wlr_surface *surface = toplevel->xdg_toplevel->base->surface;
@@ -932,9 +951,6 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel) {
   if (prev_surface == surface) {
     return;
   }
-
-  // Unfocus the old window
-  unfocus_toplevel(server);
 
   // Raise the new window
   wl_list_remove(&toplevel->link);
@@ -1127,7 +1143,7 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
     return;
   }
 
-  // Otherwise, check the type
+  // Now it's an ordinary button press on a surface.
   switch (type) {
     case TINYWL_SURFACE_TOPLEVEL: {
       struct tinywl_toplevel *toplevel = wrapper;
@@ -1143,14 +1159,20 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
     case TINYWL_SURFACE_LAYER: {
       struct tinywl_layer_surface *layer = wrapper;
       wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
-      // Route keyboard focus if the layer requested interactivity
+      // Check if the layer allows keyboard focus, on demand or exclusive.
       if (layer->wlr_layer_surface->current.keyboard_interactive !=
           ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE) {
-        wlr_seat_keyboard_notify_enter(
-            server->seat, 
-            surface, 
-            NULL, 0, NULL
-        );
+        struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(server->seat);
+        if (keyboard != NULL) {
+          wlr_seat_keyboard_notify_enter(
+              server->seat, 
+              surface, 
+              keyboard->keycodes,
+              keyboard->num_keycodes,
+              &keyboard->modifiers);
+        } else {
+          wlr_seat_keyboard_notify_enter(server->seat, surface, NULL, 0, NULL);
+        }
       }
       break;
     }
@@ -1323,7 +1345,7 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
   // Evacuate focus safely BEFORE the window data structures are destroyed
   if (was_focused) {
     if (wl_list_empty(&server->toplevels)) {
-      unfocus_toplevel(server);
+      unfocus_keyboard(server);
     } else {
       struct tinywl_toplevel *next_toplevel = wl_container_of(
           server->toplevels.next, next_toplevel, link);
@@ -1371,7 +1393,7 @@ static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
   if (was_focused) {
     if (wl_list_empty(&server->toplevels)) {
       wlr_log(WLR_DEBUG, "No more windows, so unfocus.");
-      unfocus_toplevel(server);
+      unfocus_keyboard(server);
     } else {
       struct tinywl_toplevel *next_toplevel = wl_container_of(
           server->toplevels.next, next_toplevel, link);
@@ -1802,9 +1824,9 @@ static bool handle_quick_key(struct tinywl_server *server, uint32_t sym) {
     case XKB_KEY_Escape:
       wl_display_terminate(server->wl_display);
       return true;
-    case XKB_KEY_Tab:
-      cycle_toplevels(server);
-      return true;
+//    case XKB_KEY_Tab:
+//      cycle_toplevels(server);
+//      return true;
     case XKB_KEY_d:
       spawn("wofi --show drun");
       return true;
