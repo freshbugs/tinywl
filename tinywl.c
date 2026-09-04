@@ -102,7 +102,7 @@ struct tinywl_server {
   struct wlr_scene *scene;
 
   // For resizing "wireframe layout"
-  struct wlr_scene_rect *resize_preview_rect;
+  struct wlr_scene_rect *preview_rect;
 
   // To be attached to scene, for wlr_layer_shell_unstable_v1
   struct wlr_scene_tree *scene_background;
@@ -169,9 +169,6 @@ struct tinywl_toplevel {
   struct wl_listener destroy;
   struct wl_listener request_move;
   struct wl_listener request_resize;
-
-  // Added for moving windows
-  struct wlr_box initial_geom;
 
   // added listeners for maximize, fullscreen, asynchronous resize
   struct wl_listener request_maximize;
@@ -434,6 +431,8 @@ static void handle_layer_commit(struct wl_listener *listener, void *data) {
   if (wlr_layer_surface->current.committed != 0) {
     arrange_layers(layer_surface->server);
   }
+
+  // TO DO: handle a request to change layers on the fly
 }
 
 // Called when either a xdg or layer surface requests to open a popup
@@ -526,10 +525,39 @@ static void layer_surface_handle_new_popup(struct wl_listener *listener, void *d
 }
 
 
+// Helper function to choose the scene tree matching the layer type
+static struct wlr_scene_tree *get_scene_tree_for_layer(
+    struct tinywl_server *server,
+    enum zwlr_layer_shell_v1_layer layer) {
+  switch (layer) {
+    case ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND:
+      return server->scene_background;
+    case ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM:
+      return server->scene_bottom;
+    case ZWLR_LAYER_SHELL_V1_LAYER_TOP:
+      return server->scene_top;
+    case ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY:
+      return server->scene_overlay;
+  }
+  return server->scene_top; // Fallback
+}
+
 static void server_new_layer_surface(struct wl_listener *listener, void *data) {
   struct tinywl_server *server =
       wl_container_of(listener, server, new_layer_surface);
   struct wlr_layer_surface_v1 *wlr_layer_surface = data;
+
+  // Safety, if no output
+  if (wlr_layer_surface->output == NULL) {
+    if (wl_list_empty(&server->outputs)) {
+      wlr_log(WLR_ERROR, "No outputs so cannot create layer surface");
+      wlr_layer_surface_v1_destroy(wlr_layer_surface);
+      return;
+    }
+    struct tinywl_output *output =
+        wl_container_of(server->outputs.next, output, link);
+    wlr_layer_surface->output = output->wlr_output;
+  }
 
   // Allocate our tracker
   struct tinywl_layer_surface *layer_surface =
@@ -537,22 +565,22 @@ static void server_new_layer_surface(struct wl_listener *listener, void *data) {
   layer_surface->server = server;
   layer_surface->wlr_layer_surface = wlr_layer_surface;
 
-  // Backup default output
-  if (wlr_layer_surface->output == NULL) {
-    struct tinywl_output *output =
-        wl_container_of(server->outputs.next, output, link);
-    wlr_layer_surface->output = output->wlr_output;
+  // Add it to the scene tree for the requested layer
+  struct wlr_scene_tree *layer_tree =
+      get_scene_tree_for_layer(server, wlr_layer_surface->pending.layer);
+  layer_surface->scene_layer_surface =
+      wlr_scene_layer_surface_v1_create(layer_tree, wlr_layer_surface);
+  if (!layer_surface->scene_layer_surface) {
+    wlr_log(WLR_ERROR, "Failed to create scene layer surface");
+    free(layer_surface);
+    return;
   }
+
+  // Add a pointer back to our wrapper
+  layer_surface->scene_layer_surface->tree->node.data = layer_surface;
 
   // Add it to our custom tracker
   wl_list_insert(&server->layer_surfaces, &layer_surface->link);
-
-  // Add it to the scene tree and make them point to each other
-  // TO DO: pick the right layer, using wlr_layer_surface->pending.layer
-  struct wlr_scene_tree *layer_tree = server->scene_top;
-  layer_surface->scene_layer_surface =
-      wlr_scene_layer_surface_v1_create(layer_tree, wlr_layer_surface);
-  layer_surface->scene_layer_surface->tree->node.data = layer_surface;
 
   // Connect listeners
   layer_surface->commit.notify = handle_layer_commit;
@@ -651,19 +679,19 @@ static void end_interactive(struct tinywl_server *server) {
   struct tinywl_toplevel *toplevel = server->grabbed_toplevel;
 
   // Put the window wherever the preview rectangle is
-  if (server->resize_preview_rect == NULL) {
+  if (server->preview_rect == NULL) {
     wlr_log(WLR_ERROR, "Interactive: end interaction with no rectangle.");
     return;
   }
 
   // Get the geometry
-  int x = server->resize_preview_rect->node.x;
-  int y = server->resize_preview_rect->node.y;
-  int width = server->resize_preview_rect->width;
-  int height = server->resize_preview_rect->height;
+  int x = server->preview_rect->node.x;
+  int y = server->preview_rect->node.y;
+  int width = server->preview_rect->width;
+  int height = server->preview_rect->height;
 
-  wlr_scene_node_destroy(&server->resize_preview_rect->node);
-  server->resize_preview_rect = NULL;
+  wlr_scene_node_destroy(&server->preview_rect->node);
+  server->preview_rect = NULL;
 
   // Immediately reposition
   wlr_scene_node_set_position(&toplevel->scene_tree->node, x, y);
@@ -697,7 +725,7 @@ static void end_interactive(struct tinywl_server *server) {
   }
 }
 
-// Set up an interactive move/resize, where the compositor grabs mouse events
+// Set up an interactive move/resize
 static void begin_interactive(struct tinywl_toplevel *toplevel,
                               enum tinywl_cursor_mode mode, uint32_t edges) {
   struct tinywl_server *server = toplevel->server;
@@ -715,29 +743,28 @@ static void begin_interactive(struct tinywl_toplevel *toplevel,
     toplevel->is_maximized = false;
   }
 
+  // Save initial data for the interaction
   server->grabbed_toplevel = toplevel;
   server->cursor_mode = mode;
   server->resize_edges = edges;
-
-  struct wlr_box geom;
-  wlr_xdg_surface_get_geometry(toplevel->xdg_toplevel->base, &geom);
-
-  // save the initial state of the window and cursor
-  toplevel->initial_geom.x = toplevel->scene_tree->node.x;
-  toplevel->initial_geom.y = toplevel->scene_tree->node.y;
-  toplevel->initial_geom.width = geom.width;
-  toplevel->initial_geom.height = geom.height;
   server->grabbed_cursor_x = server->cursor->x;
   server->grabbed_cursor_y = server->cursor->y;
 
-  // Make a preview rectangle
-  server->resize_preview_rect =
-      wlr_scene_rect_create(&server->scene->tree, 1, 1, 
-                            (float[]){0.13f, 0.67f, 0.6f, 0.4f});
+  // Draw a preview rectangle
+  struct wlr_box geom;
+  wlr_xdg_surface_get_geometry(toplevel->xdg_toplevel->base, &geom);
+  server->preview_rect = wlr_scene_rect_create(
+      server->scene_normal,
+      geom.width, 
+      geom.height,
+      (float[]){0.13f, 0.67f, 0.6f, 0.4f}
+  );
+  wlr_scene_node_set_position(&server->preview_rect->node,
+                              toplevel->scene_tree->node.x,
+                              toplevel->scene_tree->node.y);
 }
 
 static void handle_cursor_motion(struct tinywl_server *server, uint32_t time) {
-
   struct wlr_seat *seat = server->seat;
   // Current cursor coordinates
   int cx = server->cursor->x; 
@@ -813,20 +840,13 @@ static void handle_cursor_motion(struct tinywl_server *server, uint32_t time) {
 
   // Otherwise, a move or resize interaction is happening.
 
-  // Get the toplevel
+  // Get the geometry of the toplevel, which has not actually moved
   struct tinywl_toplevel *toplevel = server->grabbed_toplevel;
-
-  if (toplevel == NULL) {
-    wlr_log(WLR_ERROR, "Interacting with NULL toplevel");
-    end_interactive(server);
-    return;
-  }
-
-  // Get the original geometry from the start of the interaction
-  int x = server->grabbed_toplevel->initial_geom.x;
-  int y = server->grabbed_toplevel->initial_geom.y;
-  int width = toplevel->initial_geom.width;
-  int height = toplevel->initial_geom.height;
+  struct wlr_box geom;
+  wlr_xdg_surface_get_geometry(server->grabbed_toplevel->xdg_toplevel->base, &geom);
+  // Replace the x and y coordinates with absolute ones
+  geom.x = toplevel->scene_tree->node.x;
+  geom.y = toplevel->scene_tree->node.y;
 
   // How much the cursor has moved
   int dx = cx - server->grabbed_cursor_x;
@@ -834,36 +854,36 @@ static void handle_cursor_motion(struct tinywl_server *server, uint32_t time) {
 
   switch (mode) {
     case TINYWL_CURSOR_MOVE:
-      x += dx;
-      y += dy;
+      geom.x += dx;
+      geom.y += dy;
       break;
     case TINYWL_CURSOR_RESIZE:
       if (server->resize_edges & WLR_EDGE_TOP) {
-        height -= dy;
-        y += dy;
+        geom.height -= dy;
+        geom.y += dy;
       } else if (server->resize_edges & WLR_EDGE_BOTTOM) {
-        height += dy;
+        geom.height += dy;
       }
       if (server->resize_edges & WLR_EDGE_LEFT) {
-        width -= dx;
-        x += dx;
+        geom.width -= dx;
+        geom.x += dx;
       } else if (server->resize_edges & WLR_EDGE_RIGHT) {
-        width += dx;
+        geom.width += dx;
       }
       int min_width = toplevel->xdg_toplevel->current.min_width;
       int min_height = toplevel->xdg_toplevel->current.min_height;
-      if (width < min_width) width = min_width;
-      if (height < min_height) height = min_height;
-      if (width < 50) width = 50;
-      if (height < 50) height = 50;
+      if (geom.width < min_width) geom.width = min_width;
+      if (geom.height < min_height) geom.height = min_height;
+      if (geom.width < 50) geom.width = 50;
+      if (geom.height < 50) geom.height = 50;
       break;
     default:
       wlr_log(WLR_ERROR, "Unknown interaction mode.");
       return;
   }
   // Draw the preview rectangle at x,y with width,height 
-  wlr_scene_node_set_position(&server->resize_preview_rect->node, x, y);
-  wlr_scene_rect_set_size(server->resize_preview_rect, width, height);
+  wlr_scene_node_set_position(&server->preview_rect->node, geom.x, geom.y);
+  wlr_scene_rect_set_size(server->preview_rect, geom.width, geom.height);
 }
 
 // For ending a DnD
@@ -1282,13 +1302,6 @@ static void server_new_output(struct wl_listener *listener, void *data) {
   struct wlr_scene_output *scene_output =
       wlr_scene_output_create(server->scene, wlr_output);
 
-  // Background color
-  float background_color[4] = {0.02f, 0.20f, 0.20f, 1.0f};
-  wlr_scene_rect_create(server->scene_background,
-                        wlr_output->width, 
-                        wlr_output->height, 
-                        background_color);
-
   wlr_scene_output_layout_add_output(server->scene_layout, l_output,
                                      scene_output);
 }
@@ -1537,26 +1550,6 @@ static void xdg_popup_handle_destroy(struct wl_listener *listener, void *data) {
   struct tinywl_popup *popup = wl_container_of(listener, popup, destroy);
   wl_list_remove(&popup->destroy.link);
   free(popup);
-}
-
-// Helper function
-struct wlr_scene_tree *get_scene_tree_for_xdg_surface(struct wlr_xdg_surface *xdg_surface) {
-    if (!xdg_surface) return NULL;
-
-    if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
-        // If the parent is a main window, walk up to its view wrapper
-        // Note: tinywl assigns xdg_surface->data = view in server_new_xdg_surface
-        struct tinywl_toplevel *toplevel = xdg_surface->data;
-        return toplevel ? toplevel->scene_tree : NULL;
-    } 
-    else if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_POPUP) {
-        // If the parent is another popup, we have to find its wrapper
-        // You can look it up via the node tree data we saved earlier
-        struct wlr_scene_tree *popup_scene = xdg_surface->data; // or find via custom tracking
-        return popup_scene;
-    }
-
-    return NULL;
 }
 
 // A new toplevel is created, or finally assigned its role
