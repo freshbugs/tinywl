@@ -15,6 +15,4 @@ export XLOCALEDIR="/usr/share/X11/locale"
 export MOZ_ENABLE_WAYLAND=1
 export GDK_BACKEND=wayland
 
-exec /home/stephen/tinywl/tinywl -s "
-  dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP=wlroots
-  foot" >/home/stephen/tinywl/tinywl.log 2>&1
+exec /home/stephen/tinywl/tinywl -s "dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP=wlroots" >/home/stephen/tinywl/tinywl.log 2>&1
