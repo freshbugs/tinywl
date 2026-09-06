@@ -267,7 +267,6 @@ static void server_new_popup(struct tinywl_server *server,
   }
 
   if (!parent_tree) {
-    wlr_log(WLR_DEBUG, "POPUP: fall back to attaching it to root.");
     parent_tree = &server->scene->tree;
   }
 
@@ -304,6 +303,9 @@ static void server_new_popup(struct tinywl_server *server,
 
   popup->reposition.notify = handle_popup_reposition;
   wl_signal_add(&xdg_popup->events.reposition, &popup->reposition);
+
+  // Configure it! This tells the application it can start drawing.
+  wlr_xdg_surface_schedule_configure(xdg_popup->base);
 }
 
 // ----- LAYERS -----
@@ -556,6 +558,9 @@ static void server_new_layer_surface(struct wl_listener *listener, void *data) {
   }
   layer_surface->scene_layer_surface =
       wlr_scene_layer_surface_v1_create(tree, wlr_layer_surface);
+  wlr_layer_surface->surface->data =
+      layer_surface->scene_layer_surface->tree;
+
   if (!layer_surface->scene_layer_surface) {
     wlr_log(WLR_ERROR, "Failed to create scene layer surface");
     free(layer_surface);
@@ -741,7 +746,6 @@ static void handle_cursor_motion(struct tinywl_server *server, uint32_t time) {
     return;
   }
 
-
   // Implicit grab
   if ((seat->pointer_state.grab != NULL) &&
       (seat->pointer_state.grab->interface != NULL) &&
@@ -758,7 +762,7 @@ static void handle_cursor_motion(struct tinywl_server *server, uint32_t time) {
   struct wlr_surface *surface = NULL;
   enum tinywl_surface_type type;
 
-  void *wrapper = desktop_surface_at(server, y, y, &surface, &type, &sx, &sy);
+  void *wrapper = desktop_surface_at(server, x, y, &surface, &type, &sx, &sy);
 
   // notify that surface, if there is one
   if (surface) {
@@ -989,12 +993,10 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
   void *wrapper = NULL;
   enum tinywl_surface_type type;
 
-  wlr_log(WLR_DEBUG, "CURSOR: BUTTON EVENT");
   // Button releases whose corresponding press was grabbed
 
   // Release the button that started a mod+click interaction
   if (event->button == server->grabbed_active_button) {
-    wlr_log(WLR_DEBUG, "CURSOR: grabbed button release");
     // it must be a button release, no need to check
     server->grabbed_active_button = 0;
     if (server->cursor_mode != TINYWL_CURSOR_PASSTHROUGH) {
@@ -1005,7 +1007,6 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 
   // Release the button that ended a mod+click interaction
   if (event->button == server->grabbed_cancel_button) {
-    wlr_log(WLR_DEBUG, "CURSOR: cancel button release");
     server->grabbed_cancel_button = 0;
     return;
   }
@@ -1013,7 +1014,6 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
   // a second press anywhere, that ends a mod+click interaction
   if ((event->state == WL_POINTER_BUTTON_STATE_PRESSED) &&
       (server->cursor_mode != TINYWL_CURSOR_PASSTHROUGH)) {
-    wlr_log(WLR_DEBUG, "CURSOR: cancel interaction");
     server->grabbed_cancel_button = event->button;
     end_interactive(server);
     return;
@@ -1027,7 +1027,6 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
   if ((event->state == WL_POINTER_BUTTON_STATE_PRESSED) &&
       (modifiers & WLR_MODIFIER_LOGO) &&
       (type == TINYWL_SURFACE_TOPLEVEL)) {
-    wlr_log(WLR_DEBUG, "CURSOR: mod+click");
     server->grabbed_active_button = event->button;
     struct tinywl_toplevel *toplevel = wrapper;
     focus_toplevel(toplevel);
@@ -1044,7 +1043,6 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 
   // Button release
   if (event->state == WLR_BUTTON_RELEASED) {
-    wlr_log(WLR_DEBUG, "CURSOR: button release");
     wlr_seat_pointer_notify_button(server->seat,
         event->time_msec, event->button, event->state);
     wlr_seat_pointer_notify_frame(server->seat);
@@ -1056,7 +1054,6 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 
   // Click on empty space
   if ((wrapper == NULL) || (surface == NULL)) {
-    wlr_log(WLR_DEBUG, "CURSOR: click on empty space");
     wlr_seat_pointer_clear_focus(server->seat);
     unfocus_keyboard(server);
     // Bonus: click on a completely empty screen to get foot
@@ -1067,7 +1064,6 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 
   // On toplevel
   if (type == TINYWL_SURFACE_TOPLEVEL) {
-    wlr_log(WLR_DEBUG, "CURSOR: click on toplevel");
     wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
     wlr_seat_pointer_notify_button(
         server->seat, event->time_msec, event->button, event->state);
@@ -1079,7 +1075,6 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 
   // On popup
   if (type == TINYWL_SURFACE_POPUP) {
-    wlr_log(WLR_DEBUG, "CURSOR: click on popup");
     wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
     wlr_seat_pointer_notify_button(
         server->seat, event->time_msec, event->button, event->state);
@@ -1089,7 +1084,6 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 
   // On layer surface
   if (type == TINYWL_SURFACE_LAYER) {
-    wlr_log(WLR_DEBUG, "CURSOR: click on layer");
     struct tinywl_layer_surface *layer = wrapper;
 
     wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
