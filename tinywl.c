@@ -43,6 +43,8 @@
 #include <wlr/types/wlr_idle_notify_v1.h>
 #include <wlr/types/wlr_xdg_decoration_v1.h>
 #include <wlr/types/wlr_layer_shell_v1.h>
+#include <wlr/types/wlr_foreign_toplevel_management_v1.h>
+
 
 enum tinywl_cursor_mode {
   TINYWL_CURSOR_PASSTHROUGH,
@@ -139,6 +141,9 @@ struct tinywl_server {
   struct wlr_layer_shell_v1 *layer_shell;
   struct wl_list layer_surfaces;
   struct wl_listener new_layer_surface; 
+
+  // For wlr_foreign_toplevel_management_v1
+  struct wlr_foreign_toplevel_manager_v1 *foreign_toplevel_mgr;
 };
 
 struct tinywl_output {
@@ -166,9 +171,15 @@ struct tinywl_toplevel {
   // added listeners for maximize, fullscreen, asynchronous resize
   struct wl_listener request_maximize;
   struct wl_listener request_fullscreen;
+  // TO DO: tell foreign_toplevel about maximizing
 
   // Box to save properties before going fullscreen
   struct wlr_box saved_geometry;
+
+  // For wlr_foreign_toplevel_management_v1
+  struct wlr_foreign_toplevel_handle_v1 *toplevel_handle;
+  struct wl_listener set_title;
+  struct wl_listener set_app_id;
 
   // Track state
   bool is_maximized;
@@ -590,7 +601,7 @@ static void server_new_layer_surface(struct wl_listener *listener, void *data) {
   wl_signal_add(&wlr_layer_surface->events.destroy, &layer_surface->destroy);
 }
 
-// ----- PROTOCOLS -----
+// ----- OTHER PROTOCOLS -----
 
 // For wlr_idle_notifier_v1
 static void handle_idle_away(struct wl_listener *listener, void *data) {
@@ -638,6 +649,31 @@ static void xdg_popup_handle_destroy(struct wl_listener *listener, void *data) {
   wl_list_remove(&popup->destroy.link);
   free(popup);
 }
+
+// For wlr_foreign_toplevel_management_v1
+static void handle_toplevel_set_title(struct wl_listener *listener,
+                                      void *data) {
+  struct tinywl_toplevel *toplevel = 
+      wl_container_of(listener, toplevel, set_title);
+  // Ensure the foreign handle exists before sending updates
+  if (toplevel->toplevel_handle != NULL) {
+    wlr_foreign_toplevel_handle_v1_set_title(toplevel->toplevel_handle, 
+        toplevel->xdg_toplevel->title);
+  }
+}
+
+static void handle_toplevel_set_app_id(struct wl_listener *listener, void *data) {
+    struct tinywl_toplevel *toplevel = 
+        wl_container_of(listener, toplevel, set_app_id);
+        
+    if (toplevel->toplevel_handle != NULL) {
+        wlr_foreign_toplevel_handle_v1_set_app_id(
+            toplevel->toplevel_handle, 
+            toplevel->xdg_toplevel->app_id
+        );
+    }
+}
+
 
 
 // Find the generic surface wrapper responsible for a given pixel
@@ -832,6 +868,8 @@ static void begin_interactive(struct tinywl_toplevel *toplevel,
   // Unmaximize. Maximized windows do not remember their previous size.
   if (toplevel->is_maximized) {
     wlr_xdg_toplevel_set_maximized(toplevel->xdg_toplevel, false);
+    wlr_foreign_toplevel_handle_v1_set_maximized(toplevel->toplevel_handle,
+                                                 false);
     toplevel->is_maximized = false;
   }
 
@@ -908,13 +946,19 @@ static void unfocus_keyboard(struct tinywl_server *server) {
 
   wlr_seat_keyboard_clear_focus(seat);
 
-  // Deactivate visually based on surface type
+  // If its a toplevel, deactivate it and tell wlr_foreign_toplevel
   struct wlr_xdg_surface *xdg_surface =
       wlr_xdg_surface_try_from_wlr_surface(focused_surface);
   if (xdg_surface != NULL) {
     if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL &&
         xdg_surface->toplevel != NULL) {
       wlr_xdg_toplevel_set_activated(xdg_surface->toplevel, false);
+
+      struct tinywl_toplevel *toplevel = xdg_surface->data;
+      if (toplevel != NULL && toplevel->toplevel_handle != NULL) {
+        wlr_foreign_toplevel_handle_v1_set_activated(toplevel->toplevel_handle,
+                                                     false);
+      }
     }
   }
 }
@@ -928,6 +972,8 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel) {
     return;
   }
   struct tinywl_server *server = toplevel->server;
+
+ // TO DO: wlr_foreign_toplevel_handle_v1_set_activated(view->toplevel_handle, is_focused);
 
   // Unfocus the old window
   unfocus_keyboard(server);
@@ -1235,6 +1281,22 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
   // Explicitly enable the window's visual node.
   wlr_scene_node_set_enabled(&toplevel->scene_tree->node, true);
 
+  // For wlr_foreign_toplevel_management_v1
+  toplevel->toplevel_handle = wlr_foreign_toplevel_handle_v1_create(
+      toplevel->server->foreign_toplevel_mgr);
+  if (toplevel->toplevel_handle != NULL) {
+    wlr_foreign_toplevel_handle_v1_set_title(
+        toplevel->toplevel_handle, toplevel->xdg_toplevel->title);
+    wlr_foreign_toplevel_handle_v1_set_app_id(
+        toplevel->toplevel_handle, toplevel->xdg_toplevel->app_id);
+    if (!wl_list_empty(&toplevel->server->outputs)) {
+      struct tinywl_output *output =
+          wl_container_of(toplevel->server->outputs.next, output, link);
+      wlr_foreign_toplevel_handle_v1_output_enter(toplevel->toplevel_handle,
+                                                  output->wlr_output);
+    }
+  }
+
   // Focus the window
   focus_toplevel(toplevel);
 }
@@ -1309,6 +1371,10 @@ static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
   wl_list_init(&toplevel->request_maximize.link);
   wl_list_remove(&toplevel->request_fullscreen.link);
   wl_list_init(&toplevel->request_fullscreen.link);
+  wl_list_remove(&toplevel->set_title.link);
+  wl_list_init(&toplevel->set_title.link);
+  wl_list_remove(&toplevel->set_app_id.link);
+  wl_list_init(&toplevel->set_app_id.link);
 
   // clear cursor grab if this window was being manipulated
   if (server->cursor_mode != TINYWL_CURSOR_PASSTHROUGH &&
@@ -1353,6 +1419,10 @@ static void xdg_toplevel_request_resize(struct wl_listener *listener,
 // Toggle fullscreen on client request or a quick-key.
 static void xdg_toplevel_request_fullscreen(struct wl_listener *listener,
                                             void *data) {
+  // TO DO: debug this
+  // don't let other windows come in front or grab focus
+  // maybe use layers?
+  // Should I notify wlr_foreign_toplevel_handle_v1?
   struct tinywl_toplevel *toplevel =
       wl_container_of(listener, toplevel, request_fullscreen);
   struct tinywl_server *server = toplevel->server;
@@ -1437,6 +1507,10 @@ static void xdg_toplevel_request_maximize(struct wl_listener *listener,
                               layout_output->x, layout_output->y);
   wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel,
                             output->width, output->height);
+
+  wlr_xdg_toplevel_set_maximized(toplevel->xdg_toplevel, true);
+  wlr_foreign_toplevel_handle_v1_set_maximized(toplevel->toplevel_handle, true);
+  toplevel->is_maximized = true;
 }
 
 // A new toplevel is created, or finally assigned its role
@@ -1489,7 +1563,15 @@ static void server_new_toplevel(struct tinywl_server *server,
 
   toplevel->request_fullscreen.notify = xdg_toplevel_request_fullscreen;
   wl_signal_add(&xdg_surface->toplevel->events.request_fullscreen, &toplevel->request_fullscreen);
+
+  // For wlr_foreign_toplevel_management_v1 (Listen for live title/app_id edits)
+  toplevel->set_title.notify = handle_toplevel_set_title;
+  wl_signal_add(&xdg_surface->toplevel->events.set_title, &toplevel->set_title);
+
+  toplevel->set_app_id.notify = handle_toplevel_set_app_id;
+  wl_signal_add(&xdg_surface->toplevel->events.set_app_id, &toplevel->set_app_id);
 }
+
 
 // --------------
 
@@ -1512,10 +1594,11 @@ static void server_handle_xdg_map(struct wl_listener *listener, void *data) {
 }
 
 static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
-  struct tinywl_server *server = wl_container_of(listener, server, new_xdg_surface);
+  struct tinywl_server *server =
+      wl_container_of(listener, server, new_xdg_surface);
   struct wlr_xdg_surface *xdg_surface = data;
 
-  // If the app was fast and declared its role immediately, route it instantly
+  // If the app declared its role immediately, route it instantly
   if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
     server_new_toplevel(server, xdg_surface->toplevel);
     return;
@@ -1995,6 +2078,15 @@ int main(int argc, char *argv[]) {
   server.new_layer_surface.notify = server_new_layer_surface;
   wl_signal_add(&server.layer_shell->events.new_surface,
                 &server.new_layer_surface);
+
+  // wlr_foreign_toplevel_management_v1
+  server.foreign_toplevel_mgr =
+      wlr_foreign_toplevel_manager_v1_create(server.wl_display);
+  if (!server.foreign_toplevel_mgr) {
+    wlr_log(WLR_ERROR, "Failed to create wlr_foreign_toplevel_manager_v1");
+    return false;
+  }
+
 
   // Automatically link monitors to the virtual desktop tree
   // This belongs at the end of the initialization sequence
