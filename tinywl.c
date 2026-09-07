@@ -180,6 +180,8 @@ struct tinywl_toplevel {
   struct wlr_foreign_toplevel_handle_v1 *toplevel_handle;
   struct wl_listener set_title;
   struct wl_listener set_app_id;
+  struct wl_listener foreign_activate;
+  struct wl_listener foreign_close;
 
   // Track state
   bool is_maximized;
@@ -272,7 +274,13 @@ static void server_new_popup(struct tinywl_server *server,
       wlr_layer_surface_v1_try_from_wlr_surface(xdg_popup->parent);
 
   if (parent_xdg != NULL) {
-    parent_tree = parent_xdg->surface->data;
+    if (parent_xdg->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
+      struct tinywl_toplevel *toplevel = parent_xdg->data;
+      if (toplevel != NULL) parent_tree = toplevel->scene_tree;
+    } else if (parent_xdg->role == WLR_XDG_SURFACE_ROLE_POPUP) {
+      struct tinywl_popup *parent_popup = parent_xdg->data;
+      if (parent_popup != NULL) parent_tree = parent_popup->scene_tree;
+    }
   } else if (parent_layer != NULL) {
     parent_tree = parent_layer->surface->data;
   }
@@ -323,6 +331,7 @@ static void server_new_popup(struct tinywl_server *server,
 // --- wlr_layer_shell_unstable_v1 ---
 
 // Anchor layers to the sides and calculate usable space
+// Very simple - layers might overlap in the corners if there are many
 static void arrange_layers(struct tinywl_server *server) {
   if (wl_list_empty(&server->outputs)) {
     return; 
@@ -344,101 +353,20 @@ static void arrange_layers(struct tinywl_server *server) {
 
   struct tinywl_layer_surface *layer_surface;
 
-  // --- PASS 1: Calculate Usable Area ---
   wl_list_for_each(layer_surface, &server->layer_surfaces, link) {
-    struct wlr_layer_surface_v1 *wlr_surface = layer_surface->wlr_layer_surface;
-    struct wlr_layer_surface_v1_state *state = &wlr_surface->pending;
-
-    // Skip if it doesn't request an exclusive zone
-    if (state->exclusive_zone <= 0) {
-      continue;
-    }
-
-    // Shrink usable_area along one edge
-    // It is anchored to that edge but not its opposite edge
-    if ((state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP) && 
-       !(state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM)) {
-      usable_area.y += state->exclusive_zone;
-      usable_area.height -= state->exclusive_zone;
-    } else if ((state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM) && 
-               !(state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP)) {
-      usable_area.height -= state->exclusive_zone;
-    } else if ((state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT) && 
-               !(state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT)) {
-      usable_area.x += state->exclusive_zone;
-      usable_area.width -= state->exclusive_zone;
-    } else if ((state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT) && 
-          !(state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT)) {
-      usable_area.width -= state->exclusive_zone;
-    }
-  }
-
-  // --- PASS 2: Position and Configure Surfaces ---
-  wl_list_for_each(layer_surface, &server->layer_surfaces, link) {
-    struct wlr_layer_surface_v1 *wlr_surface = layer_surface->wlr_layer_surface;
-    struct wlr_layer_surface_v1_state *state = &wlr_surface->pending;
-
-    // Default to requested sizes
-    int width = state->desired_width;
-    int height = state->desired_height;
-
-    // Check horizontal anchor stretching
-    if ((state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT) &&
-        (state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT)) {
-      width = full_area.width; // Wallpapers/overlays span full screen width
-      if (state->exclusive_zone > 0) {
-        width = usable_area.width; // Exclusive panels match usable bounds
-      }
-    }
-
-    // Check vertical anchor stretching
-    if ((state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP) &&
-        (state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM)) {
-      height = full_area.height;
-      if (state->exclusive_zone > 0) {
-        height = usable_area.height;
-      }
-    }
-
-    // Protect against passing 0 dimensions to the client
-    if (width <= 0) width = state->desired_width ? state->desired_width : 100;
-    if (height <= 0) height = state->desired_height ? state->desired_height : 100;
-
-    // Determine absolute position coordinates (x, y)
-    int x = full_area.x;
-    int y = full_area.y;
-
-    if (state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT) {
-      x = full_area.x + full_area.width - width;
-    }
-    if (state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM) {
-      y = full_area.y + full_area.height - height;
-    }
-
-    // Apply margins
-    if (state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT) {
-      x += state->margin.left;
-    }
-    if (state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT) {
-      x -= state->margin.right;
-    }
-    if (state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP) {
-      y += state->margin.top;
-    }
-    if (state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM) {
-      y -= state->margin.bottom;
-    }
-
-    // Update the scene node position
-    wlr_scene_node_set_position(
-        &layer_surface->scene_layer_surface->tree->node, x, y);
-
-    // Send the configure event to the client
-    wlr_layer_surface_v1_configure(wlr_surface, width, height);
-
-    // Update the scene-graph element
+    // Let wlroots position the scene node and update the usable area
     wlr_scene_layer_surface_v1_configure(layer_surface->scene_layer_surface,
                                          &full_area, &usable_area);
+
+    // Extract the actual surface reference
+    struct wlr_layer_surface_v1 *wlr_surface = layer_surface->scene_layer_surface->layer_surface;
+
+    // Width and height are in the current/scheduled layout geometry
+    uint32_t width = wlr_surface->pending.desired_width;
+    uint32_t height = wlr_surface->pending.desired_height;
+    
+    // Send the configure event to the client
+    wlr_layer_surface_v1_configure(wlr_surface, width, height);
   }
 }
 
@@ -674,7 +602,96 @@ static void handle_toplevel_set_app_id(struct wl_listener *listener, void *data)
     }
 }
 
+// Clear keyboard focus from whatever surface currently holds it
+static void unfocus_keyboard(struct tinywl_server *server) {
+  struct wlr_seat *seat = server->seat;
+  struct wlr_surface *focused_surface = seat->keyboard_state.focused_surface;
 
+  // Clear key grabs, even if there is more than one keyboard
+  struct tinywl_keyboard *kbd;
+  wl_list_for_each(kbd, &server->keyboards, link) {
+    kbd->grabbed_keycode = 0;
+  }
+
+  if (focused_surface == NULL) return;
+
+  wlr_seat_keyboard_clear_focus(seat);
+
+  // If its a toplevel, deactivate it and tell wlr_foreign_toplevel
+  struct wlr_xdg_surface *xdg_surface =
+      wlr_xdg_surface_try_from_wlr_surface(focused_surface);
+  if (xdg_surface != NULL) {
+    if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL &&
+        xdg_surface->toplevel != NULL) {
+      wlr_xdg_toplevel_set_activated(xdg_surface->toplevel, false);
+
+      struct tinywl_toplevel *toplevel = xdg_surface->data;
+      if (toplevel != NULL && toplevel->toplevel_handle != NULL) {
+        wlr_foreign_toplevel_handle_v1_set_activated(toplevel->toplevel_handle,
+                                                     false);
+      }
+    }
+  }
+}
+
+// focus_toplevel - only for keyboard focus
+static void focus_toplevel(struct tinywl_toplevel *toplevel) {
+  if ((toplevel == NULL) ||
+      (toplevel->xdg_toplevel == NULL) ||
+      (toplevel->xdg_toplevel->base == NULL)) {
+    wlr_log(WLR_ERROR, "Trying to focus an invalid toplevel.");
+    return;
+  }
+  struct tinywl_server *server = toplevel->server;
+
+ // TO DO: wlr_foreign_toplevel_handle_v1_set_activated(view->toplevel_handle, is_focused);
+
+  // Unfocus the old window
+  unfocus_keyboard(server);
+  
+  struct wlr_seat *seat = server->seat;
+  struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
+  struct wlr_surface *surface = toplevel->xdg_toplevel->base->surface;
+  struct wlr_surface *prev_surface = seat->keyboard_state.focused_surface;
+
+  if (prev_surface == surface) {
+    return;
+  }
+
+  // Raise the new window
+  wl_list_remove(&toplevel->link);
+  wl_list_insert(&server->toplevels, &toplevel->link);
+  if (toplevel->scene_tree) {
+    wlr_scene_node_raise_to_top(&toplevel->scene_tree->node);
+  }
+
+  // Protocol-level activation, so dialogs can draw active borders/titles
+  wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
+
+  if (keyboard != NULL) {
+    wlr_seat_keyboard_notify_enter(seat, surface, keyboard->keycodes,
+        keyboard->num_keycodes, &keyboard->modifiers);
+  } else {
+    wlr_seat_keyboard_notify_enter(seat, surface, NULL, 0, NULL);
+  }
+}
+
+
+static void handle_foreign_activate(struct wl_listener *listener, void *data) {
+    struct tinywl_toplevel *toplevel = 
+        wl_container_of(listener, toplevel, foreign_activate);
+    focus_toplevel(toplevel);
+}
+
+static void handle_foreign_close(struct wl_listener *listener, void *data) {
+    struct tinywl_toplevel *toplevel = 
+        wl_container_of(listener, toplevel, foreign_close);
+    wlr_xdg_toplevel_send_close(toplevel->xdg_toplevel);
+}
+
+
+
+//-------
 
 // Find the generic surface wrapper responsible for a given pixel
 // Also set its type, and relative coordinates.
@@ -768,7 +785,7 @@ static void handle_cursor_motion(struct tinywl_server *server, uint32_t time) {
     }
 
     if (server->resize_edges & WLR_EDGE_LEFT) {
-      left -= dx;
+      left += dx;
       if (right - left < min_width) left = right - min_width;
     } else if (server->resize_edges & WLR_EDGE_RIGHT) {
       right += dx;
@@ -931,79 +948,6 @@ static void handle_start_drag(struct wl_listener *listener, void *data) {
   wl_signal_add(&drag->events.destroy, &server->destroy_drag);
 }
 
-// Clear keyboard focus from whatever surface currently holds it
-static void unfocus_keyboard(struct tinywl_server *server) {
-  struct wlr_seat *seat = server->seat;
-  struct wlr_surface *focused_surface = seat->keyboard_state.focused_surface;
-
-  // Clear key grabs, even if there is more than one keyboard
-  struct tinywl_keyboard *kbd;
-  wl_list_for_each(kbd, &server->keyboards, link) {
-    kbd->grabbed_keycode = 0;
-  }
-
-  if (focused_surface == NULL) return;
-
-  wlr_seat_keyboard_clear_focus(seat);
-
-  // If its a toplevel, deactivate it and tell wlr_foreign_toplevel
-  struct wlr_xdg_surface *xdg_surface =
-      wlr_xdg_surface_try_from_wlr_surface(focused_surface);
-  if (xdg_surface != NULL) {
-    if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL &&
-        xdg_surface->toplevel != NULL) {
-      wlr_xdg_toplevel_set_activated(xdg_surface->toplevel, false);
-
-      struct tinywl_toplevel *toplevel = xdg_surface->data;
-      if (toplevel != NULL && toplevel->toplevel_handle != NULL) {
-        wlr_foreign_toplevel_handle_v1_set_activated(toplevel->toplevel_handle,
-                                                     false);
-      }
-    }
-  }
-}
-
-// focus_toplevel - only for keyboard focus
-static void focus_toplevel(struct tinywl_toplevel *toplevel) {
-  if ((toplevel == NULL) ||
-      (toplevel->xdg_toplevel == NULL) ||
-      (toplevel->xdg_toplevel->base == NULL)) {
-    wlr_log(WLR_ERROR, "Trying to focus an invalid toplevel.");
-    return;
-  }
-  struct tinywl_server *server = toplevel->server;
-
- // TO DO: wlr_foreign_toplevel_handle_v1_set_activated(view->toplevel_handle, is_focused);
-
-  // Unfocus the old window
-  unfocus_keyboard(server);
-  
-  struct wlr_seat *seat = server->seat;
-  struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
-  struct wlr_surface *surface = toplevel->xdg_toplevel->base->surface;
-  struct wlr_surface *prev_surface = seat->keyboard_state.focused_surface;
-
-  if (prev_surface == surface) {
-    return;
-  }
-
-  // Raise the new window
-  wl_list_remove(&toplevel->link);
-  wl_list_insert(&server->toplevels, &toplevel->link);
-  if (toplevel->scene_tree) {
-    wlr_scene_node_raise_to_top(&toplevel->scene_tree->node);
-  }
-
-  // Protocol-level activation, so dialogs can draw active borders/titles
-  wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
-
-  if (keyboard != NULL) {
-    wlr_seat_keyboard_notify_enter(seat, surface, keyboard->keycodes,
-        keyboard->num_keycodes, &keyboard->modifiers);
-  } else {
-    wlr_seat_keyboard_notify_enter(seat, surface, NULL, 0, NULL);
-  }
-}
 
 // Triggered by a relative pointer motion event
 static void server_cursor_motion(struct wl_listener *listener, void *data) {
@@ -1295,6 +1239,12 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
       wlr_foreign_toplevel_handle_v1_output_enter(toplevel->toplevel_handle,
                                                   output->wlr_output);
     }
+    toplevel->foreign_activate.notify = handle_foreign_activate;
+    wl_signal_add(&toplevel->toplevel_handle->events.request_activate, 
+                  &toplevel->foreign_activate);
+    toplevel->foreign_close.notify = handle_foreign_close;
+    wl_signal_add(&toplevel->toplevel_handle->events.request_close, 
+                  &toplevel->foreign_close);
   }
 
   // Focus the window
@@ -1327,6 +1277,14 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
   (void)data;
   struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, unmap);
   struct tinywl_server *server = toplevel->server;
+
+  // Disconnect hooks related to wlr_foreign_toplevel_management_v1
+  if (toplevel->toplevel_handle != NULL) {
+    wl_list_remove(&toplevel->foreign_activate.link);
+    wl_list_remove(&toplevel->foreign_close.link);
+    wlr_foreign_toplevel_handle_v1_destroy(toplevel->toplevel_handle);
+    toplevel->toplevel_handle = NULL;
+  }
 
   // Always clear cursor grab if this window was being manipulated
   if (server->cursor_mode != TINYWL_CURSOR_PASSTHROUGH &&
