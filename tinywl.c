@@ -360,9 +360,11 @@ static void arrange_layers(struct tinywl_server *server) {
     // Extract the actual surface reference
     struct wlr_layer_surface_v1 *wlr_surface = layer_surface->scene_layer_surface->layer_surface;
 
-    // Width and height are in the current/scheduled layout geometry
-    uint32_t width = wlr_surface->pending.desired_width;
-    uint32_t height = wlr_surface->pending.desired_height;
+    // Width and height
+    uint32_t width = wlr_surface->pending.actual_width;
+    uint32_t height = wlr_surface->pending.actual_height;
+    if (width == 0) width = full_area.width;
+    if (height == 0) height = full_area.height;
     
     // Send the configure event to the client
     wlr_layer_surface_v1_configure(wlr_surface, width, height);
@@ -496,8 +498,10 @@ static void server_new_layer_surface(struct wl_listener *listener, void *data) {
   }
   layer_surface->scene_layer_surface =
       wlr_scene_layer_surface_v1_create(tree, wlr_layer_surface);
+/* Not needed??
   wlr_layer_surface->surface->data =
       layer_surface->scene_layer_surface->tree;
+*/
 
   if (!layer_surface->scene_layer_surface) {
     wlr_log(WLR_ERROR, "Failed to create scene layer surface");
@@ -526,6 +530,8 @@ static void server_new_layer_surface(struct wl_listener *listener, void *data) {
 
   layer_surface->destroy.notify = handle_layer_destroy;
   wl_signal_add(&wlr_layer_surface->events.destroy, &layer_surface->destroy);
+
+  arrange_layers(server);
 }
 
 // ----- OTHER PROTOCOLS -----
