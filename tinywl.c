@@ -57,12 +57,6 @@ enum tinywl_surface_type {
   TINYWL_SURFACE_LAYER,
 };
 
-struct tinywl_toplevel_marker {
-  struct tinywl_server *server;
-  struct wlr_xdg_surface *xdg_surface;
-  struct wl_listener map;
-};
-
 struct tinywl_server {
   struct wl_display *wl_display;
   struct wlr_backend *backend;
@@ -251,79 +245,6 @@ static void handle_popup_reposition(struct wl_listener *listener, void *data) {
                               popup->xdg_popup->current.geometry.x,
                               popup->xdg_popup->current.geometry.y);
   // TO DO: again prevent it spilling off-screen
-}
-
-
-// Handle new popup owned by any kind of surface
-static void server_new_popup(struct tinywl_server *server,
-                             struct wlr_xdg_popup *xdg_popup) {
-  // calloc my custom wrapper
-  struct tinywl_popup *popup = calloc(1, sizeof(*popup));
-  if (popup == NULL) {
-    wlr_log(WLR_ERROR, "Failed to allocate memory for popup tracking");
-    return;
-  }
-
-  // Find the appropriate tree, depending on the parent type
-  struct wlr_scene_tree *parent_tree = NULL;
-
-  struct wlr_xdg_surface *parent_xdg =
-      wlr_xdg_surface_try_from_wlr_surface(xdg_popup->parent);
-  struct wlr_layer_surface_v1 *parent_layer =
-      wlr_layer_surface_v1_try_from_wlr_surface(xdg_popup->parent);
-
-  if (parent_xdg != NULL) {
-    if (parent_xdg->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
-      struct tinywl_toplevel *toplevel = parent_xdg->data;
-      if (toplevel != NULL) parent_tree = toplevel->scene_tree;
-    } else if (parent_xdg->role == WLR_XDG_SURFACE_ROLE_POPUP) {
-      struct tinywl_popup *parent_popup = parent_xdg->data;
-      if (parent_popup != NULL) parent_tree = parent_popup->scene_tree;
-    }
-  } else if (parent_layer != NULL) {
-    parent_tree = parent_layer->surface->data;
-  }
-
-  if (!parent_tree) {
-    parent_tree = &server->scene->tree;
-  }
-
-  // Let the scene graph attach it automatically
-  popup->scene_tree =
-      wlr_scene_xdg_surface_create(parent_tree, xdg_popup->base);
-  if (!popup->scene_tree) {
-    wlr_log(WLR_ERROR, "POPUP: failed to attach to the scene tree.");
-    free(popup);
-    return;
-  }
-
-  // Hook up the server back-pointer 
-  popup->server = server;
-  popup->xdg_popup = xdg_popup;
-
-  // Cross-link data pointers
-  xdg_popup->base->data = popup;
-  popup->scene_tree->node.data = popup;
-
-  // Prevent the popup from spilling off-screen
-  struct wlr_output *output = wlr_output_layout_output_at(
-      server->output_layout, server->cursor->x, server->cursor->y);
-  if (output != NULL) {
-    struct wlr_box output_box;
-    wlr_output_layout_get_box(server->output_layout, output, &output_box);
-    // TO DO: worry about offsets, especially if multi-monitor
-    wlr_xdg_popup_unconstrain_from_box(xdg_popup, &output_box);
-  }
-
-  // Connect listeners
-  popup->destroy.notify = handle_popup_destroy;
-  wl_signal_add(&xdg_popup->base->events.destroy, &popup->destroy);
-
-  popup->reposition.notify = handle_popup_reposition;
-  wl_signal_add(&xdg_popup->events.reposition, &popup->reposition);
-
-  // Configure it! This tells the application it can start drawing.
-  wlr_xdg_surface_schedule_configure(xdg_popup->base);
 }
 
 // ----- LAYERS -----
@@ -1493,11 +1414,104 @@ static void xdg_toplevel_request_maximize(struct wl_listener *listener,
   toplevel->is_maximized = true;
 }
 
-// A new toplevel is created, or finally assigned its role
-static void server_new_toplevel(struct tinywl_server *server,
-                                struct wlr_xdg_toplevel *xdg_toplevel) {
-  struct wlr_xdg_surface *xdg_surface = xdg_toplevel->base;
 
+static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
+  struct tinywl_server *server =
+      wl_container_of(listener, server, new_xdg_surface);
+  struct wlr_xdg_surface *xdg_surface = data;
+
+  // NEW POPUP
+  if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_POPUP) {
+    struct tinywl_popup *popup = calloc(1, sizeof(*popup));
+    if (popup == NULL) {
+      wlr_log(WLR_ERROR, "Failed to allocate memory for popup tracking");
+      return;
+    }
+
+    // Find the appropriate tree, depending on the parent type
+    struct wlr_scene_tree *parent_tree = NULL;
+
+    struct wlr_xdg_surface *parent_xdg =
+        wlr_xdg_surface_try_from_wlr_surface(xdg_surface->popup->parent);
+    struct wlr_layer_surface_v1 *parent_layer =
+        wlr_layer_surface_v1_try_from_wlr_surface(xdg_surface->popup->parent);
+
+    // toplevel parent
+    if ((parent_xdg != NULL) &&
+        (parent_xdg->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL)) {
+      struct tinywl_toplevel *parent_toplevel = parent_xdg->data;
+      if (parent_toplevel != NULL) {
+        parent_tree = parent_toplevel->scene_tree;
+      }
+    }
+
+    // popup parent
+    else if ((parent_xdg != NULL) &&
+        (parent_xdg->role == WLR_XDG_SURFACE_ROLE_POPUP)) {
+      struct tinywl_popup *parent_popup = parent_xdg->data;
+      if (parent_popup != NULL) {
+        parent_tree = parent_popup->scene_tree;
+      }
+    }
+
+    // layer parent
+    else if (parent_layer != NULL) {
+      parent_tree = parent_layer->surface->data;
+    }
+
+
+    if (parent_tree == NULL) {
+      wlr_log(WLR_DEBUG, "POPUP: failed to find a scene tree.");
+      parent_tree = &server->scene->tree;
+    }
+
+    // Let the scene graph attach it automatically
+    popup->scene_tree =
+        wlr_scene_xdg_surface_create(parent_tree, xdg_surface->popup->base);
+    if (!popup->scene_tree) {
+      wlr_log(WLR_ERROR, "POPUP: failed to attach to the scene tree.");
+      free(popup);
+      return;
+    }
+
+    // Hook up the server back-pointer 
+    popup->server = server;
+    popup->xdg_popup = xdg_surface->popup;
+
+    // Cross-link data pointers
+    xdg_surface->popup->base->data = popup;
+    popup->scene_tree->node.data = popup;
+
+    // Prevent the popup from spilling off-screen
+    struct wlr_output *output = wlr_output_layout_output_at(
+        server->output_layout, server->cursor->x, server->cursor->y);
+    if (output != NULL) {
+      struct wlr_box output_box;
+      wlr_output_layout_get_box(server->output_layout, output, &output_box);
+      // TO DO: worry about offsets, especially if multi-monitor
+      wlr_xdg_popup_unconstrain_from_box(xdg_surface->popup, &output_box);
+    }
+
+    // Connect listeners
+    popup->destroy.notify = handle_popup_destroy;
+    wl_signal_add(&xdg_surface->popup->base->events.destroy, &popup->destroy);
+
+    popup->reposition.notify = handle_popup_reposition;
+    wl_signal_add(&xdg_surface->popup->events.reposition, &popup->reposition);
+
+    // Configure it! This tells the application it can start drawing.
+    wlr_xdg_surface_schedule_configure(xdg_surface->popup->base);
+
+    return;
+  }
+
+  // NOT A POPUP AND NOT A TOPLEVEL
+  if (xdg_surface->role != WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
+    wlr_log(WLR_ERROR, "New xdg surface with unknown role");
+    return;
+  }
+
+  // IT'S A TOPLEVEL 
   struct tinywl_toplevel *toplevel = calloc(1, sizeof(struct tinywl_toplevel));
   if (toplevel == NULL) {
     wlr_log(WLR_ERROR, "Failed to allocate memory for toplevel tracking.");
@@ -1506,14 +1520,21 @@ static void server_new_toplevel(struct tinywl_server *server,
 
   toplevel->type = TINYWL_SURFACE_TOPLEVEL;
   toplevel->server = server;
-  toplevel->xdg_toplevel = xdg_toplevel;
+  toplevel->xdg_toplevel = xdg_surface->toplevel;
 
   // Attach to the root scene tree
   toplevel->scene_tree =
-      wlr_scene_xdg_surface_create(server->scene_normal, xdg_surface);
+      wlr_scene_xdg_surface_create(server->scene_normal, xdg_surface->toplevel->base);
+
+  if (toplevel->scene_tree == NULL) {
+    wlr_log(WLR_ERROR, "Failed to create scene graph node for toplevel.");
+    wl_list_remove(&toplevel->link);
+    free(toplevel);
+    return;
+  }
 
   // Make compositor/wlr wrappers point to each other
-  xdg_surface->data = toplevel;
+  xdg_surface->toplevel->base->data = toplevel;
   toplevel->scene_tree->node.data = toplevel;
 
   // Add to the our tracking list 
@@ -1522,14 +1543,14 @@ static void server_new_toplevel(struct tinywl_server *server,
   // Connect listeners
   // Core Surface Layer Events (map, unmap)
   toplevel->map.notify = xdg_toplevel_map;
-  wl_signal_add(&xdg_surface->surface->events.map, &toplevel->map);
+  wl_signal_add(&xdg_surface->toplevel->base->surface->events.map, &toplevel->map);
 
   toplevel->unmap.notify = xdg_toplevel_unmap;
-  wl_signal_add(&xdg_surface->surface->events.unmap, &toplevel->unmap);
+  wl_signal_add(&xdg_surface->toplevel->base->surface->events.unmap, &toplevel->unmap);
 
   // Shell Management Layer Event (destroy)
   toplevel->destroy.notify = xdg_toplevel_destroy;
-  wl_signal_add(&xdg_surface->events.destroy, &toplevel->destroy);
+  wl_signal_add(&xdg_surface->toplevel->base->events.destroy, &toplevel->destroy);
 
   // Window Type Interaction Events (move, resize, maximize, fullscreen)
   toplevel->request_move.notify = xdg_toplevel_request_move;
@@ -1551,61 +1572,6 @@ static void server_new_toplevel(struct tinywl_server *server,
   toplevel->set_app_id.notify = handle_toplevel_set_app_id;
   wl_signal_add(&xdg_surface->toplevel->events.set_app_id, &toplevel->set_app_id);
 }
-
-
-// --------------
-// deal with the initial commit, with yet-to-be-determined role
-// --------------
-
-
-
-
-// --------------
-
-static void server_handle_xdg_map(struct wl_listener *listener, void *data) {
-  // This fires when the client window physically draws its initial content buffer
-  struct tinywl_toplevel_marker *marker = wl_container_of(listener, marker, map);
-  struct wlr_xdg_surface *xdg_surface = marker->xdg_surface;
-  struct tinywl_server *server = marker->server;
-
-  // Now that it's mapping, the role is 100% guaranteed to be defined
-  if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
-    server_new_toplevel(server, xdg_surface->toplevel);
-  } else if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_POPUP) {
-    server_new_popup(server, xdg_surface->popup);
-  }
-
-  // Disconnect the temporary map listener and free the microscopic tracking label
-  wl_list_remove(&marker->map.link);
-  free(marker);
-}
-
-static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
-  struct tinywl_server *server =
-      wl_container_of(listener, server, new_xdg_surface);
-  struct wlr_xdg_surface *xdg_surface = data;
-
-  // If the app declared its role immediately, route it instantly
-  if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
-    server_new_toplevel(server, xdg_surface->toplevel);
-    return;
-  }
-  if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_POPUP) {
-    server_new_popup(server, xdg_surface->popup);
-    return;
-  }
-
-  // If the role is unassigned, we track ONLY the map signal (NO commit loops!)
-  struct tinywl_toplevel_marker *marker = calloc(1, sizeof(*marker));
-  if (!marker) return;
-
-  marker->server = server;
-  marker->xdg_surface = xdg_surface;
-  marker->map.notify = server_handle_xdg_map;
-  wl_signal_add(&xdg_surface->surface->events.map, &marker->map);
-}
-
-// ----
 
 
 // For xdg_activation_v1 - eg., click on a link opens a browser
