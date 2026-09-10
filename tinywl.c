@@ -45,7 +45,6 @@
 #include <wlr/types/wlr_layer_shell_v1.h>
 #include <wlr/types/wlr_foreign_toplevel_management_v1.h>
 
-
 enum tinywl_cursor_mode {
   TINYWL_CURSOR_PASSTHROUGH,
   TINYWL_CURSOR_MOVE,
@@ -651,7 +650,12 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel) {
   
   struct wlr_seat *seat = server->seat;
   struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
-  struct wlr_surface *surface = toplevel->xdg_toplevel->base->surface;
+
+  struct wlr_surface *surface = seat->pointer_state.focused_surface;
+  if (surface == NULL) {
+    surface = toplevel->xdg_toplevel->base->surface;
+  }
+
   struct wlr_surface *prev_surface = seat->keyboard_state.focused_surface;
 
   if (prev_surface == surface) {
@@ -689,15 +693,15 @@ static void handle_foreign_close(struct wl_listener *listener, void *data) {
     wlr_xdg_toplevel_send_close(toplevel->xdg_toplevel);
 }
 
-
-
 //-------
+
 
 // Find the generic surface wrapper responsible for a given pixel
 // Also set its type, and relative coordinates.
 static void *desktop_surface_at(struct tinywl_server *server,
     double x, double y, struct wlr_surface **surface, 
     enum tinywl_surface_type *type, double *sx, double *sy) {
+  // x,y are "layout coordinates" and sx,sy are surface coordinates
   
   // Let wlroots find the scene node for that pixel
   struct wlr_scene_node *node =
@@ -715,7 +719,7 @@ static void *desktop_surface_at(struct tinywl_server *server,
   }
   *surface = scene_surface->surface;
 
-  // Climb the tree
+  // Climb the tree to find the wrapper pointer
   struct wlr_scene_tree *tree = node->parent;
   while (tree != NULL) {
     if (tree->node.data != NULL) {
@@ -799,13 +803,25 @@ static void handle_cursor_motion(struct tinywl_server *server, uint32_t time) {
     return;
   }
 
-  // Implicit grab
+  // Implicit grab 
   if ((seat->pointer_state.grab != NULL) &&
       (seat->pointer_state.grab->interface != NULL) &&
       (seat->pointer_state.button_count > 0)) {
-    seat->pointer_state.grab->interface->motion(seat->pointer_state.grab,
-                                                time, x, y);
-    wlr_seat_pointer_notify_frame(seat);
+    
+    double sx, sy;
+    // Pass the node member of the scene tree
+    struct wlr_scene_node *node = wlr_scene_node_at(&server->scene->tree.node,
+        server->cursor->x, server->cursor->y, &sx, &sy);
+
+    if (node != NULL && node->type == WLR_SCENE_NODE_BUFFER) {
+      struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
+        
+      // try to get the scene surface from the buffer
+      struct wlr_scene_surface *scene_surface =
+          wlr_scene_surface_try_from_buffer(scene_buffer);
+        
+      wlr_seat_pointer_notify_motion(seat, time, sx, sy);
+    }
     return;
   }
 
@@ -1054,20 +1070,20 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 
   // On toplevel
   if (type == TINYWL_SURFACE_TOPLEVEL) {
-    wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
-    wlr_seat_pointer_notify_button(
-        server->seat, event->time_msec, event->button, event->state);
-    wlr_seat_pointer_notify_frame(server->seat);
     struct tinywl_toplevel *toplevel = wrapper;
     focus_toplevel(toplevel);
+    wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
+    wlr_seat_pointer_notify_button(server->seat, event->time_msec,
+                                   event->button, event->state);
+    wlr_seat_pointer_notify_frame(server->seat);
     return;
   }
 
   // On popup
   if (type == TINYWL_SURFACE_POPUP) {
     wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
-    wlr_seat_pointer_notify_button(
-        server->seat, event->time_msec, event->button, event->state);
+    wlr_seat_pointer_notify_button(server->seat, event->time_msec,
+                                   event->button, event->state);
     wlr_seat_pointer_notify_frame(server->seat);
     return;
   }
@@ -1529,6 +1545,13 @@ static void server_new_toplevel(struct tinywl_server *server,
   toplevel->set_app_id.notify = handle_toplevel_set_app_id;
   wl_signal_add(&xdg_surface->toplevel->events.set_app_id, &toplevel->set_app_id);
 }
+
+
+// --------------
+// deal with the initial commit, with yet-to-be-determined role
+// --------------
+
+
 
 
 // --------------
