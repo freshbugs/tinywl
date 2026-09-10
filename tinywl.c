@@ -104,12 +104,10 @@ struct tinywl_server {
   struct wlr_scene_output_layout *scene_layout;
 
   // for DnD
-  struct wlr_drag *current_drag;
   struct wlr_scene_tree *drag_icon_tree;
-  bool next_commit_at_cursor;
   struct wl_listener request_start_drag;
-  struct wl_listener start_drag;
-  struct wl_listener destroy_drag;
+  bool next_commit_at_cursor; //TO DO: use this to make tab tearing spawn under the cursor
+  // or is that a hack to avoid dealing specifically with the quirks of tab tearing?
 
   // For xdg_activation_v1
   struct wlr_xdg_activation_v1 *xdg_activation;
@@ -629,14 +627,12 @@ static void *desktop_surface_at(struct tinywl_server *server,
     double x, double y, struct wlr_surface **surface, 
     enum tinywl_surface_type *type, double *sx, double *sy) {
   // x,y are "layout coordinates" and sx,sy are surface coordinates
-  
   // Let wlroots find the scene node for that pixel
   struct wlr_scene_node *node =
       wlr_scene_node_at(&server->scene->tree.node, x, y, sx, sy);
   if (node == NULL || node->type != WLR_SCENE_NODE_BUFFER) {
     return NULL;
   }
-
   // Get the wlroots surface
   struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
   struct wlr_scene_surface *scene_surface =
@@ -645,7 +641,6 @@ static void *desktop_surface_at(struct tinywl_server *server,
     return NULL;
   }
   *surface = scene_surface->surface;
-
   // Climb the tree to find the wrapper pointer
   struct wlr_scene_tree *tree = node->parent;
   while (tree != NULL) {
@@ -660,7 +655,6 @@ static void *desktop_surface_at(struct tinywl_server *server,
     }
     tree = tree->node.parent;
   }
-
   return NULL;
 }
 
@@ -672,8 +666,6 @@ static void handle_cursor_motion(struct tinywl_server *server, uint32_t time) {
   double y = server->cursor->y;
   enum tinywl_cursor_mode mode = server->cursor_mode;
   struct wlr_surface *focused = seat->pointer_state.focused_surface;
-
-  // TO DO: set up a listener for DnD icon surface's commit signal
 
   // interactive move or resize
   if (mode != TINYWL_CURSOR_PASSTHROUGH) {
@@ -730,6 +722,33 @@ static void handle_cursor_motion(struct tinywl_server *server, uint32_t time) {
     return;
   }
 
+  // DnD
+  if (seat->drag) {
+    double sx, sy;
+    struct wlr_scene_node *node = wlr_scene_node_at(&server->scene->tree.node, x, y, &sx, &sy);
+    struct wlr_surface *surface = NULL;
+
+    if (node && node->type == WLR_SCENE_NODE_BUFFER) {
+      struct wlr_scene_buffer *sb = wlr_scene_buffer_from_node(node);
+      struct wlr_scene_surface *ss = wlr_scene_surface_try_from_buffer(sb);
+      if (ss) surface = ss->surface;
+    }
+
+    if (surface) {
+      wlr_seat_pointer_notify_enter(seat, surface, sx, sy);
+      wlr_seat_pointer_notify_motion(seat, time, sx, sy);
+    } else {
+      wlr_seat_pointer_clear_focus(seat);
+    }
+
+    if (server->drag_icon_tree) {
+      wlr_scene_node_set_position(&server->drag_icon_tree->node, x, y);
+    }
+
+    wlr_seat_pointer_notify_frame(seat);
+    return;
+  }
+  
   // Implicit grab 
   if ((seat->pointer_state.grab != NULL) &&
       (seat->pointer_state.grab->interface != NULL) &&
@@ -756,9 +775,19 @@ static void handle_cursor_motion(struct tinywl_server *server, uint32_t time) {
 
   double sx, sy;
   struct wlr_surface *surface = NULL;
-  enum tinywl_surface_type type;
+  struct wlr_scene_buffer *scene_buffer = NULL;
+  struct wlr_scene_surface *scene_surface = NULL;
+  struct wlr_scene_node *node =
+      wlr_scene_node_at(&server->scene->tree.node, x, y, &sx, &sy);
 
-  void *wrapper = desktop_surface_at(server, x, y, &surface, &type, &sx, &sy);
+  if (node && node->type == WLR_SCENE_NODE_BUFFER) {
+    scene_buffer = wlr_scene_buffer_from_node(node);
+    scene_surface = wlr_scene_surface_try_from_buffer(scene_buffer);
+  }
+
+  if (scene_surface) {
+    surface = scene_surface->surface;
+  }
 
   // notify that surface, if there is one
   if (surface) {
@@ -768,7 +797,7 @@ static void handle_cursor_motion(struct tinywl_server *server, uint32_t time) {
     wlr_seat_pointer_clear_focus(seat);
     wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
   }
-    
+
   wlr_seat_pointer_notify_frame(seat);
 }
 
@@ -854,6 +883,7 @@ static void begin_interactive(struct tinywl_toplevel *toplevel,
                               toplevel->scene_tree->node.y);
 }
 
+/*
 // For ending a DnD
 static void handle_destroy_drag(struct wl_listener *listener,
                                        void *data) {
@@ -870,27 +900,26 @@ static void handle_destroy_drag(struct wl_listener *listener,
   wl_list_remove(&server->destroy_drag.link);
   wl_list_init(&server->destroy_drag.link); // eliminate dangling pointers
 }
+*/
 
 // For starting a DnD
-static void handle_start_drag(struct wl_listener *listener, void *data) {
-  struct tinywl_server *server = wl_container_of(listener, server, start_drag);
-  struct wlr_drag *drag = data;
-  struct wlr_drag_icon *icon = drag->icon;
+// TO DO: add drag_icon_destroy listener to struct tinywl_server, then:
+// server->drag_icon_tree = NULL; wl_list_remove(&server->drag_icon_destroy.link)
+static void server_handle_request_start_drag(struct wl_listener *listener,
+                                             void *data) {
+  struct tinywl_server *server = wl_container_of(listener, server, request_start_drag);
+  struct wlr_seat_request_start_drag_event *event = data;
+  struct wlr_drag *drag = event->drag;
 
-  server->current_drag = drag;
-  server->next_commit_at_cursor = false;
+  // Tell the seat to allow the drag operation
+  wlr_seat_start_pointer_drag(server->seat, drag, event->serial);
 
-  if (icon) {
-    // Generate the scene node and save its reference in the icon's data slot
-    struct wlr_scene_tree *icon_tree =
-        wlr_scene_drag_icon_create(&server->scene->tree, icon);
-    icon->data = &icon_tree->node;
+  // Attach the icon to the scene tree, if provided
+  if (drag->icon) {
+    server->drag_icon_tree =
+        wlr_scene_drag_icon_create(server->scene_overlay, drag->icon);
   }
-
-  server->destroy_drag.notify = handle_destroy_drag;
-  wl_signal_add(&drag->events.destroy, &server->destroy_drag);
 }
-
 
 // Triggered by a relative pointer motion event
 static void server_cursor_motion(struct wl_listener *listener, void *data) {
@@ -1410,7 +1439,9 @@ static void xdg_toplevel_request_maximize(struct wl_listener *listener,
                             output->width, output->height);
 
   wlr_xdg_toplevel_set_maximized(toplevel->xdg_toplevel, true);
-  wlr_foreign_toplevel_handle_v1_set_maximized(toplevel->toplevel_handle, true);
+  if (toplevel && toplevel->toplevel_handle) {
+    wlr_foreign_toplevel_handle_v1_set_maximized(toplevel->toplevel_handle, true);
+  }
   toplevel->is_maximized = true;
 }
 
@@ -1600,6 +1631,7 @@ static void server_request_activation(struct wl_listener *listener, void *data) 
   }
 }
 
+/*
 // For DnD
 static void server_handle_request_start_drag(struct wl_listener *listener,
                                              void *data) {
@@ -1614,6 +1646,7 @@ static void server_handle_request_start_drag(struct wl_listener *listener,
   }
   wlr_seat_start_pointer_drag(server->seat, event->drag, event->serial);
 }
+*/
 
 // Function triggered when a modifier key is pressed.
 static void keyboard_handle_modifiers(struct wl_listener *listener,
@@ -1988,8 +2021,6 @@ int main(int argc, char *argv[]) {
   server.request_start_drag.notify = server_handle_request_start_drag;
   wl_signal_add(&server.seat->events.request_start_drag,
                 &server.request_start_drag);
-  server.start_drag.notify = handle_start_drag;
-  wl_signal_add(&server.seat->events.start_drag, &server.start_drag);
 
   // PROTOCOLS
 
