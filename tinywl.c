@@ -144,6 +144,8 @@ struct tinywl_output {
   struct wl_listener frame;
   struct wl_listener request_state;
   struct wl_listener destroy;
+
+  struct wlr_box usable_area; // for layers
 };
 
 struct tinywl_toplevel {
@@ -173,6 +175,7 @@ struct tinywl_toplevel {
   struct wl_listener set_app_id;
   struct wl_listener foreign_activate;
   struct wl_listener foreign_close;
+  struct wl_listener foreign_maximize;
 
   // Track state
   bool is_maximized;
@@ -249,7 +252,6 @@ static void handle_popup_reposition(struct wl_listener *listener, void *data) {
 // --- wlr_layer_shell_unstable_v1 ---
 
 // Anchor layers to the sides and calculate usable space
-// Very simple - layers might overlap in the corners if there are many
 static void arrange_layers(struct tinywl_server *server) {
   if (wl_list_empty(&server->outputs)) {
     return; 
@@ -288,6 +290,8 @@ static void arrange_layers(struct tinywl_server *server) {
     // Send the configure event to the client
     wlr_layer_surface_v1_configure(wlr_surface, width, height);
   }
+
+  tinywl_output->usable_area = usable_area;
 }
 
 static void handle_layer_map(struct wl_listener *listener, void *data) {
@@ -606,6 +610,46 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel) {
 }
 
 
+// TO DO: save the previous geometry.
+static void xdg_toplevel_request_maximize(struct wl_listener *listener,
+                                          void *data) {
+  struct tinywl_toplevel *toplevel;
+  if (listener == NULL) {
+    // invoked manually
+    toplevel = data;
+  } else {
+    // invoked by a listener
+    toplevel = wl_container_of(listener, toplevel, request_maximize);
+  }
+  struct tinywl_server *server = toplevel->server;
+  
+  // Look up the monitor under the cursor
+  struct wlr_output *output = wlr_output_layout_output_at(
+      server->output_layout, server->cursor->x, server->cursor->y);
+  if (!output) {
+    return;
+  }   
+
+  // Get its usable area
+  struct tinywl_output *tinywl_output = output->data;
+  struct wlr_box *usable_area = &tinywl_output->usable_area;
+
+  // Position and size the window
+  wlr_scene_node_set_position(&toplevel->scene_tree->node,
+                              usable_area->x,
+                              usable_area->y);
+  wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel,
+                            usable_area->width, usable_area->height);
+
+  if (toplevel->toplevel_handle) {
+    wlr_foreign_toplevel_handle_v1_set_maximized(toplevel->toplevel_handle, true);
+  }
+  
+  toplevel->is_maximized = true;
+}
+
+
+
 static void handle_foreign_activate(struct wl_listener *listener, void *data) {
     struct tinywl_toplevel *toplevel = 
         wl_container_of(listener, toplevel, foreign_activate);
@@ -617,6 +661,24 @@ static void handle_foreign_close(struct wl_listener *listener, void *data) {
         wl_container_of(listener, toplevel, foreign_close);
     wlr_xdg_toplevel_send_close(toplevel->xdg_toplevel);
 }
+
+static void handle_foreign_maximize(struct wl_listener *listener, void *data) {
+  struct tinywl_toplevel *toplevel =
+      wl_container_of(listener, toplevel, foreign_maximize);
+  struct wlr_foreign_toplevel_handle_v1_maximized_event *event = data;
+
+  if (event->maximized) {
+    xdg_toplevel_request_maximize(NULL, toplevel); 
+  } else {
+    // TO DO: write an unmaximize handler
+    wlr_xdg_toplevel_set_maximized(toplevel->xdg_toplevel, false);
+    if (toplevel->toplevel_handle) {
+      wlr_foreign_toplevel_handle_v1_set_maximized(toplevel->toplevel_handle, false);
+    }
+    toplevel->is_maximized = false;
+  }
+}
+
 
 //-------
 
@@ -883,27 +945,9 @@ static void begin_interactive(struct tinywl_toplevel *toplevel,
                               toplevel->scene_tree->node.y);
 }
 
-/*
-// For ending a DnD
-static void handle_destroy_drag(struct wl_listener *listener,
-                                       void *data) {
-  struct tinywl_server *server =
-      wl_container_of(listener, server, destroy_drag);
-
-  // Clear our active drag pointer
-  server->current_drag = NULL;
-
-  // Trigger the flag so the next mapped window maps at the cursor
-  server->next_commit_at_cursor = true;
-
-  // Disconnect this temporary listener until the next drag happens
-  wl_list_remove(&server->destroy_drag.link);
-  wl_list_init(&server->destroy_drag.link); // eliminate dangling pointers
-}
-*/
 
 // For starting a DnD
-// TO DO: add drag_icon_destroy listener to struct tinywl_server, then:
+// TO DO: add "drag_icon_destroy listener" to struct tinywl_server, then:
 // server->drag_icon_tree = NULL; wl_list_remove(&server->drag_icon_destroy.link)
 static void server_handle_request_start_drag(struct wl_listener *listener,
                                              void *data) {
@@ -1152,6 +1196,15 @@ static void server_new_output(struct wl_listener *listener, void *data) {
   struct tinywl_output *output = calloc(1, sizeof(*output));
   output->wlr_output = wlr_output;
   output->server = server;
+  wlr_output->data = output;
+
+  // Initialize the usable_area
+  int width, height;
+  wlr_output_effective_resolution(wlr_output, &width, &height);
+  output->usable_area.x = 0;
+  output->usable_area.y = 0;
+  output->usable_area.width = width;
+  output->usable_area.height = height;
 
   // Set up listeners.
   output->frame.notify = output_frame;
@@ -1217,6 +1270,9 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
     toplevel->foreign_close.notify = handle_foreign_close;
     wl_signal_add(&toplevel->toplevel_handle->events.request_close, 
                   &toplevel->foreign_close);
+    toplevel->foreign_maximize.notify = handle_foreign_maximize;
+    wl_signal_add(&toplevel->toplevel_handle->events.request_maximize, 
+                  &toplevel->foreign_maximize);
   }
 
   // Focus the window
@@ -1254,17 +1310,18 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
   if (toplevel->toplevel_handle != NULL) {
     wl_list_remove(&toplevel->foreign_activate.link);
     wl_list_remove(&toplevel->foreign_close.link);
+    wl_list_remove(&toplevel->foreign_maximize.link);
     wlr_foreign_toplevel_handle_v1_destroy(toplevel->toplevel_handle);
     toplevel->toplevel_handle = NULL;
   }
 
-  // Always clear cursor grab if this window was being manipulated
+  // Clear cursor grab if this window was being manipulated
   if (server->cursor_mode != TINYWL_CURSOR_PASSTHROUGH &&
       toplevel == server->grabbed_toplevel) {
     end_interactive(server);
   }
 
-  // Always clear keyboard focus if it had it
+  // Clear keyboard focus if it had it
   struct wlr_surface *focused = server->seat->keyboard_state.focused_surface;
   if (focused && focused == toplevel->xdg_toplevel->base->surface) {
     wlr_seat_keyboard_clear_focus(server->seat);
@@ -1408,41 +1465,6 @@ static void xdg_toplevel_request_fullscreen(struct wl_listener *listener,
     toplevel->is_fullscreen = false;
     wlr_xdg_toplevel_set_fullscreen(toplevel->xdg_toplevel, false);
   }
-}
-
-// Maximize. TO DO: check the usable area
-// Do not save the previous size.
-static void xdg_toplevel_request_maximize(struct wl_listener *listener,
-                                          void *data) {
-  struct tinywl_toplevel *toplevel =
-      wl_container_of(listener, toplevel, request_maximize);
-  struct tinywl_server *server = toplevel->server;
-
-  // Look up the monitor under the cursor
-  struct wlr_output *output = wlr_output_layout_output_at(
-      server->output_layout, server->cursor->x, server->cursor->y);
-  if (!output) {
-    return;
-  }
-
-  // find this monitor in the virtual grid
-  struct wlr_output_layout_output *layout_output =
-    wlr_output_layout_get(server->output_layout, output);
-  if (!layout_output) {
-    return;
-  }
-
-  // Snap the window to the top-left corner and set it to full screen size
-  wlr_scene_node_set_position(&toplevel->scene_tree->node,
-                              layout_output->x, layout_output->y);
-  wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel,
-                            output->width, output->height);
-
-  wlr_xdg_toplevel_set_maximized(toplevel->xdg_toplevel, true);
-  if (toplevel && toplevel->toplevel_handle) {
-    wlr_foreign_toplevel_handle_v1_set_maximized(toplevel->toplevel_handle, true);
-  }
-  toplevel->is_maximized = true;
 }
 
 
@@ -1630,23 +1652,6 @@ static void server_request_activation(struct wl_listener *listener, void *data) 
     }
   }
 }
-
-/*
-// For DnD
-static void server_handle_request_start_drag(struct wl_listener *listener,
-                                             void *data) {
-  struct wlr_seat_request_start_drag_event *event = data;
-  struct tinywl_server *server =
-      wl_container_of(listener, server, request_start_drag);
-  if (!wlr_seat_validate_pointer_grab_serial(server->seat, event->origin,
-                                            event->serial)) {
-    // click state does not match active seat state
-    wlr_data_source_destroy(event->drag->source);
-    return;
-  }
-  wlr_seat_start_pointer_drag(server->seat, event->drag, event->serial);
-}
-*/
 
 // Function triggered when a modifier key is pressed.
 static void keyboard_handle_modifiers(struct wl_listener *listener,
