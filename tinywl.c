@@ -729,6 +729,9 @@ static void handle_cursor_motion(struct tinywl_server *server, uint32_t time) {
   enum tinywl_cursor_mode mode = server->cursor_mode;
   struct wlr_surface *focused = seat->pointer_state.focused_surface;
 
+  // Reset the idle notifier every time this function is called
+  wlr_idle_notifier_v1_notify_activity(server->idle_notifier, server->seat);
+
   // interactive move or resize
   if (mode != TINYWL_CURSOR_PASSTHROUGH) {
     // The toplevel has not actually moved
@@ -1742,11 +1745,13 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 
   struct tinywl_server *server = keyboard->server;
 
+  // Reset the idle notifier every time this function is called
+  wlr_idle_notifier_v1_notify_activity(server->idle_notifier, server->seat);
+
+
   if (server == NULL) return;
   if (keyboard->wlr_keyboard == NULL) return;
   if (keyboard->wlr_keyboard->xkb_state == NULL) return;
-
-  wlr_idle_notifier_v1_notify_activity(server->idle_notifier, server->seat);
 
   // Ensure the seat knows this hardware keyboard is active.
   wlr_seat_set_keyboard(server->seat, keyboard->wlr_keyboard);
