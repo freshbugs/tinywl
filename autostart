@@ -6,10 +6,13 @@ dbus-update-activation-environment --systemd WAYLAND_DISPLAY DISPLAY XDG_CURRENT
 # set the default browser
 xdg-settings set default-web-browser librewolf.desktop
 
+foot &
+
+sleep 1
+
 # Launch background daemons and status bars
 waybar &
 swhks & swhkd &
-foot &
 
 saved="$XDG_RUNTIME_DIR/saved-brightness"
 swayidle \

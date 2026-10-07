@@ -995,8 +995,12 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
   struct tinywl_server *server =
       wl_container_of(listener, server, cursor_button);
   struct wlr_pointer_button_event *event = data;
-  uint32_t modifiers =
-      wlr_keyboard_get_modifiers(wlr_seat_get_keyboard(server->seat));
+  struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(server->seat);
+  uint32_t modifiers = 0;
+  if (keyboard != NULL) {
+    modifiers = wlr_keyboard_get_modifiers(keyboard);
+  }
+  
   double sx, sy;
   struct wlr_surface *surface = NULL;
   void *wrapper = NULL;
