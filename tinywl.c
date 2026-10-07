@@ -26,6 +26,9 @@
 #include <wlr/util/log.h>
 #include <xkbcommon/xkbcommon.h>
 
+// Added for waitpid
+#include <sys/wait.h>
+
 // I added this for BTN_LEFT
 #include <linux/input-event-codes.h>
 
@@ -218,17 +221,19 @@ struct tinywl_layer_surface {
 
 // spawn a shell process
 static void spawn(const char *cmd) {
-  // A standard doule-fork trick makes systemd deal with cleanup.
-  // The grandchild becomes an orphan, so gets adopted by systemd.
-  if (fork() == 0) {
+  pid_t pid = fork();
+  if (pid == 0) {
     if (fork() == 0) {
       execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
-      wlr_log(WLR_ERROR, "spawn: execl failed: %s", strerror(errno));
-      _exit(1); // if execl fails for some reason (rare)
+      _exit(1);
     }
     _exit(0);
   }
+  if (pid > 0) {
+    waitpid(pid, NULL, 0); 
+  }
 }
+
 
 // ----- POPUPS -----
 
