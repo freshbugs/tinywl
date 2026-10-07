@@ -1,0 +1,17 @@
+#!/bin/sh
+
+# update D-Bus and Systemd environments so apps know the socket
+dbus-update-activation-environment --systemd WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP=wlroots
+
+# set the default browser
+xdg-settings set default-web-browser librewolf.desktop
+
+# Launch background daemons and status bars
+waybar &
+swhks & swhkd &
+foot &
+
+saved="$XDG_RUNTIME_DIR/saved-brightness"
+swayidle \
+  timeout 600 "brightnessctl get > '$saved' && brightnessctl set 1" \
+  resume "brightnessctl set \"\$(cat '$saved')\""
